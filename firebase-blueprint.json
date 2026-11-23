@@ -1,0 +1,314 @@
+{
+  "entities": {
+    "StoreWorkspace": {
+      "title": "StoreWorkspace",
+      "description": "Root Kirana store workspace profile and cloud sync metadata owned by a single verified user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the store owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "storeName": {
+          "type": "string",
+          "description": "Store display name.",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "ownerName": {
+          "type": "string",
+          "description": "Store owner full name.",
+          "maxLength": 120
+        },
+        "phone": {
+          "type": "string",
+          "description": "Store contact phone number.",
+          "maxLength": 32
+        },
+        "address": {
+          "type": "string",
+          "description": "Store street address.",
+          "maxLength": 300
+        },
+        "upiId": {
+          "type": "string",
+          "description": "Store UPI VPA.",
+          "maxLength": 120
+        },
+        "gstin": {
+          "type": "string",
+          "description": "Optional GSTIN.",
+          "maxLength": 32
+        },
+        "lastClosedDate": {
+          "type": "string",
+          "description": "ISO date string of last completed daily closing.",
+          "maxLength": 32
+        },
+        "whatsappTemplateConfig": {
+          "type": "object",
+          "description": "Custom WhatsApp reminder template configuration."
+        },
+        "localUpdatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last local modification.",
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server last update timestamp."
+        }
+      },
+      "required": ["ownerId", "storeName", "localUpdatedAt", "createdAt", "updatedAt"]
+    },
+    "CloudCustomer": {
+      "title": "CloudCustomer",
+      "description": "Synced customer Khata account.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "phone": { "type": "string", "maxLength": 32 },
+        "address": { "type": "string", "maxLength": 300 },
+        "openingBalance": { "type": "number" },
+        "currentBalance": { "type": "number" },
+        "totalCreditGiven": { "type": "number" },
+        "totalPaymentReceived": { "type": "number" },
+        "whatsappConsent": { "type": "boolean" },
+        "localUpdatedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "name", "currentBalance", "localUpdatedAt", "createdAt", "updatedAt"]
+    },
+    "CloudCustomerTransaction": {
+      "title": "CloudCustomerTransaction",
+      "description": "Synced customer Khata ledger entry.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "customerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": {
+          "type": "string",
+          "enum": ["CREDIT", "PAYMENT", "RETURN", "ADJUSTMENT", "OPENING", "OPENING_BALANCE"]
+        },
+        "amount": { "type": "number" },
+        "date": { "type": "string", "maxLength": 40 },
+        "description": { "type": "string", "maxLength": 400 },
+        "paymentMethod": { "type": "string", "maxLength": 20 },
+        "invoiceNo": { "type": "string", "maxLength": 64 },
+        "status": { "type": "string", "maxLength": 32 },
+        "localUpdatedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "customerId", "type", "amount", "date", "localUpdatedAt", "createdAt", "updatedAt"]
+    },
+    "CloudSupplier": {
+      "title": "CloudSupplier",
+      "description": "Synced wholesale supplier account.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "phone": { "type": "string", "maxLength": 32 },
+        "category": { "type": "string", "maxLength": 100 },
+        "address": { "type": "string", "maxLength": 300 },
+        "openingBalance": { "type": "number" },
+        "currentBalance": { "type": "number" },
+        "totalPurchases": { "type": "number" },
+        "totalPaid": { "type": "number" },
+        "localUpdatedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "name", "currentBalance", "localUpdatedAt", "createdAt", "updatedAt"]
+    },
+    "CloudSupplierTransaction": {
+      "title": "CloudSupplierTransaction",
+      "description": "Synced supplier purchase or payment transaction.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "supplierId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": {
+          "type": "string",
+          "enum": ["PURCHASE", "PAYMENT", "RETURN", "PURCHASE_RETURN", "ADJUSTMENT", "OPENING", "OPENING_BALANCE"]
+        },
+        "amount": { "type": "number" },
+        "date": { "type": "string", "maxLength": 40 },
+        "paymentStatus": { "type": "string", "maxLength": 24 },
+        "paymentMethod": { "type": "string", "maxLength": 20 },
+        "description": { "type": "string", "maxLength": 400 },
+        "invoiceNo": { "type": "string", "maxLength": 64 },
+        "status": { "type": "string", "maxLength": 32 },
+        "localUpdatedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "supplierId", "type", "amount", "date", "localUpdatedAt", "createdAt", "updatedAt"]
+    },
+    "CloudSaleRecord": {
+      "title": "CloudSaleRecord",
+      "description": "Synced counter sale invoice.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "invoiceNo": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "date": { "type": "string", "maxLength": 40 },
+        "customerId": { "type": "string", "maxLength": 128 },
+        "customerName": { "type": "string", "maxLength": 160 },
+        "amount": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["CASH", "UPI", "CARD", "CREDIT", "BANK"] },
+        "isCredit": { "type": "boolean" },
+        "items": { "type": "array" },
+        "notes": { "type": "string", "maxLength": 400 },
+        "localUpdatedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "invoiceNo", "date", "amount", "paymentMethod", "isCredit", "localUpdatedAt", "createdAt", "updatedAt"]
+    },
+    "CloudExpenseRecord": {
+      "title": "CloudExpenseRecord",
+      "description": "Synced shop expense or personal withdrawal record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "category": { "type": "string", "maxLength": 40 },
+        "amount": { "type": "number" },
+        "isPersonalWithdrawal": { "type": "boolean" },
+        "paymentMethod": { "type": "string", "maxLength": 20 },
+        "date": { "type": "string", "maxLength": 40 },
+        "notes": { "type": "string", "maxLength": 400 },
+        "localUpdatedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "title", "category", "amount", "isPersonalWithdrawal", "paymentMethod", "date", "localUpdatedAt", "createdAt", "updatedAt"]
+    },
+    "CloudCashbookEntry": {
+      "title": "CloudCashbookEntry",
+      "description": "Synced Rokad cashbook entry.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "date": { "type": "string", "maxLength": 40 },
+        "type": { "type": "string", "enum": ["IN", "OUT"] },
+        "category": { "type": "string", "maxLength": 64 },
+        "description": { "type": "string", "maxLength": 400 },
+        "amount": { "type": "number" },
+        "paymentMode": { "type": "string", "maxLength": 20 },
+        "refType": { "type": "string", "maxLength": 40 },
+        "refId": { "type": "string", "maxLength": 128 },
+        "localUpdatedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "date", "type", "category", "amount", "localUpdatedAt", "createdAt", "updatedAt"]
+    },
+    "CloudProduct": {
+      "title": "CloudProduct",
+      "description": "Synced kirana inventory item.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "category": { "type": "string", "maxLength": 80 },
+        "unit": { "type": "string", "maxLength": 32 },
+        "costPrice": { "type": "number" },
+        "sellingPrice": { "type": "number" },
+        "mrp": { "type": "number" },
+        "stockQty": { "type": "number" },
+        "minStockAlert": { "type": "number" },
+        "preferredSupplierId": { "type": "string", "maxLength": 128 },
+        "preferredSupplierName": { "type": "string", "maxLength": 160 },
+        "isArchived": { "type": "boolean" },
+        "localUpdatedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "name", "unit", "costPrice", "sellingPrice", "stockQty", "localUpdatedAt", "createdAt", "updatedAt"]
+    },
+    "CloudBackupManifest": {
+      "title": "CloudBackupManifest",
+      "description": "Verified backup snapshot manifest metadata (checksum + counts) synced to Firestore.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "bucket": { "type": "string", "enum": ["DAILY", "WEEKLY", "MANUAL"] },
+        "trigger": { "type": "string", "enum": ["AUTO_INTERVAL", "AUTO_BATCH", "MANUAL", "PRE_RESTORE"] },
+        "checksum": { "type": "string", "maxLength": 128 },
+        "sizeBytes": { "type": "number" },
+        "totalTransactions": { "type": "number" },
+        "salesCount": { "type": "number" },
+        "customersCount": { "type": "number" },
+        "productsCount": { "type": "number" },
+        "localCreatedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "bucket", "trigger", "checksum", "totalTransactions", "localCreatedAt", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/stores/{userId}": {
+      "schema": { "$ref": "#/backend/entities/StoreWorkspace" },
+      "description": "Root workspace for an authenticated store owner."
+    },
+    "/stores/{userId}/customers/{customerId}": {
+      "schema": { "$ref": "#/backend/entities/CloudCustomer" },
+      "description": "Customer Khata accounts under the owner's store."
+    },
+    "/stores/{userId}/customerTransactions/{txId}": {
+      "schema": { "$ref": "#/backend/entities/CloudCustomerTransaction" },
+      "description": "Customer ledger transactions under the owner's store."
+    },
+    "/stores/{userId}/suppliers/{supplierId}": {
+      "schema": { "$ref": "#/backend/entities/CloudSupplier" },
+      "description": "Supplier Vyapari accounts under the owner's store."
+    },
+    "/stores/{userId}/supplierTransactions/{txId}": {
+      "schema": { "$ref": "#/backend/entities/CloudSupplierTransaction" },
+      "description": "Supplier purchase and payment transactions under the owner's store."
+    },
+    "/stores/{userId}/sales/{saleId}": {
+      "schema": { "$ref": "#/backend/entities/CloudSaleRecord" },
+      "description": "Completed counter sales bills under the owner's store."
+    },
+    "/stores/{userId}/expenses/{expenseId}": {
+      "schema": { "$ref": "#/backend/entities/CloudExpenseRecord" },
+      "description": "Shop expenses and personal drawings under the owner's store."
+    },
+    "/stores/{userId}/cashbookEntries/{entryId}": {
+      "schema": { "$ref": "#/backend/entities/CloudCashbookEntry" },
+      "description": "Cash drawer Rokad entries under the owner's store."
+    },
+    "/stores/{userId}/products/{productId}": {
+      "schema": { "$ref": "#/backend/entities/CloudProduct" },
+      "description": "Kirana product catalog and stock quantities under the owner's store."
+    },
+    "/stores/{userId}/backupManifests/{backupId}": {
+      "schema": { "$ref": "#/backend/entities/CloudBackupManifest" },
+      "description": "Backup verification manifests for audit and multi-device awareness."
+    }
+  }
+}

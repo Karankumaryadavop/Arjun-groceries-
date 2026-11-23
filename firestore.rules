@@ -1,0 +1,486 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Helpers
+    function isSignedInVerified() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isStoreOwner(userId) {
+      return isSignedInVerified() && request.auth.uid == userId;
+    }
+
+    function storeParentValid(userId) {
+      return exists(/databases/$(database)/documents/stores/$(userId)) &&
+        get(/databases/$(database)/documents/stores/$(userId)).data.ownerId == request.auth.uid;
+    }
+
+    function isOptionalString(data, key, maxLen) {
+      return !(key in data) || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function isOptionalNumber(data, key) {
+      return !(key in data) || (data[key] is number);
+    }
+
+    function isOptionalBool(data, key) {
+      return !(key in data) || (data[key] is bool);
+    }
+
+    function isNotCancelled(data) {
+      return !('status' in data) || !(data.status in ['CANCELLED', 'REVERSED']);
+    }
+
+    // Entity Validators
+    function isValidStoreWorkspace(data, userId) {
+      return data.keys().hasAll(['ownerId', 'storeName', 'localUpdatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'ownerId', 'storeName', 'ownerName', 'phone', 'address', 'upiId', 'gstin',
+          'lastClosedDate', 'whatsappTemplateConfig', 'localUpdatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.storeName is string && data.storeName.size() >= 1 && data.storeName.size() <= 160 &&
+        data.localUpdatedAt is string && data.localUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalString(data, 'ownerName', 120) &&
+        isOptionalString(data, 'phone', 32) &&
+        isOptionalString(data, 'address', 300) &&
+        isOptionalString(data, 'upiId', 120) &&
+        isOptionalString(data, 'gstin', 32) &&
+        isOptionalString(data, 'lastClosedDate', 32) &&
+        (!('whatsappTemplateConfig' in data) || (
+          data.whatsappTemplateConfig is map &&
+          data.whatsappTemplateConfig.keys().hasOnly([
+            'templateName', 'bodyTemplate', 'footerText', 'includeInvoiceList', 'includeUpiId', 'updatedAt'
+          ]) &&
+          isOptionalString(data.whatsappTemplateConfig, 'templateName', 80) &&
+          isOptionalString(data.whatsappTemplateConfig, 'bodyTemplate', 1000) &&
+          isOptionalString(data.whatsappTemplateConfig, 'footerText', 120) &&
+          isOptionalBool(data.whatsappTemplateConfig, 'includeInvoiceList') &&
+          isOptionalBool(data.whatsappTemplateConfig, 'includeUpiId') &&
+          isOptionalString(data.whatsappTemplateConfig, 'updatedAt', 40)
+        ));
+    }
+
+    function isValidCloudCustomer(data, userId, customerId) {
+      return data.keys().hasAll(['id', 'ownerId', 'name', 'currentBalance', 'localUpdatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'name', 'phone', 'address', 'openingBalance', 'currentBalance',
+          'totalCreditGiven', 'totalPaymentReceived', 'whatsappConsent', 'localUpdatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && isValidId(data.id) && data.id == customerId &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+        data.currentBalance is number &&
+        data.localUpdatedAt is string && data.localUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalString(data, 'phone', 32) &&
+        isOptionalString(data, 'address', 300) &&
+        isOptionalNumber(data, 'openingBalance') &&
+        isOptionalNumber(data, 'totalCreditGiven') &&
+        isOptionalNumber(data, 'totalPaymentReceived') &&
+        isOptionalBool(data, 'whatsappConsent');
+    }
+
+    function isValidCloudCustomerTx(data, userId, txId) {
+      return data.keys().hasAll(['id', 'ownerId', 'customerId', 'type', 'amount', 'date', 'localUpdatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'customerId', 'type', 'amount', 'date', 'description',
+          'paymentMethod', 'invoiceNo', 'status', 'localUpdatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && isValidId(data.id) && data.id == txId &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.customerId is string && isValidId(data.customerId) &&
+        data.type in ['CREDIT', 'PAYMENT', 'RETURN', 'ADJUSTMENT', 'OPENING', 'OPENING_BALANCE'] &&
+        data.amount is number &&
+        data.date is string && data.date.size() <= 40 &&
+        data.localUpdatedAt is string && data.localUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalString(data, 'description', 400) &&
+        isOptionalString(data, 'paymentMethod', 20) &&
+        isOptionalString(data, 'invoiceNo', 64) &&
+        isOptionalString(data, 'status', 32);
+    }
+
+    function isValidCloudSupplier(data, userId, supplierId) {
+      return data.keys().hasAll(['id', 'ownerId', 'name', 'currentBalance', 'localUpdatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'name', 'phone', 'category', 'address', 'openingBalance',
+          'currentBalance', 'totalPurchases', 'totalPaid', 'localUpdatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && isValidId(data.id) && data.id == supplierId &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+        data.currentBalance is number &&
+        data.localUpdatedAt is string && data.localUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalString(data, 'phone', 32) &&
+        isOptionalString(data, 'category', 100) &&
+        isOptionalString(data, 'address', 300) &&
+        isOptionalNumber(data, 'openingBalance') &&
+        isOptionalNumber(data, 'totalPurchases') &&
+        isOptionalNumber(data, 'totalPaid');
+    }
+
+    function isValidCloudSupplierTx(data, userId, txId) {
+      return data.keys().hasAll(['id', 'ownerId', 'supplierId', 'type', 'amount', 'date', 'localUpdatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'supplierId', 'type', 'amount', 'date', 'paymentStatus',
+          'paymentMethod', 'description', 'invoiceNo', 'status', 'localUpdatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && isValidId(data.id) && data.id == txId &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.supplierId is string && isValidId(data.supplierId) &&
+        data.type in ['PURCHASE', 'PAYMENT', 'RETURN', 'PURCHASE_RETURN', 'ADJUSTMENT', 'OPENING', 'OPENING_BALANCE'] &&
+        data.amount is number &&
+        data.date is string && data.date.size() <= 40 &&
+        data.localUpdatedAt is string && data.localUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalString(data, 'paymentStatus', 24) &&
+        isOptionalString(data, 'paymentMethod', 20) &&
+        isOptionalString(data, 'description', 400) &&
+        isOptionalString(data, 'invoiceNo', 64) &&
+        isOptionalString(data, 'status', 32);
+    }
+
+    function isValidCloudSale(data, userId, saleId) {
+      return data.keys().hasAll(['id', 'ownerId', 'invoiceNo', 'date', 'amount', 'paymentMethod', 'isCredit', 'localUpdatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'invoiceNo', 'date', 'customerId', 'customerName',
+          'amount', 'paymentMethod', 'isCredit', 'items', 'notes', 'localUpdatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && isValidId(data.id) && data.id == saleId &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.invoiceNo is string && data.invoiceNo.size() >= 1 && data.invoiceNo.size() <= 64 &&
+        data.date is string && data.date.size() <= 40 &&
+        data.amount is number &&
+        data.paymentMethod in ['CASH', 'UPI', 'CARD', 'CREDIT', 'BANK'] &&
+        data.isCredit is bool &&
+        data.localUpdatedAt is string && data.localUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalString(data, 'customerId', 128) &&
+        isOptionalString(data, 'customerName', 160) &&
+        isOptionalString(data, 'notes', 400) &&
+        (!('items' in data) || (
+          data.items is list && data.items.size() <= 100 &&
+          (data.items.size() == 0 || data.items[0] is map)
+        ));
+    }
+
+    function isValidCloudExpense(data, userId, expenseId) {
+      return data.keys().hasAll(['id', 'ownerId', 'title', 'category', 'amount', 'isPersonalWithdrawal', 'paymentMethod', 'date', 'localUpdatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'title', 'category', 'amount', 'isPersonalWithdrawal',
+          'paymentMethod', 'date', 'notes', 'localUpdatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && isValidId(data.id) && data.id == expenseId &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 180 &&
+        data.category is string && data.category.size() <= 40 &&
+        data.amount is number &&
+        data.isPersonalWithdrawal is bool &&
+        data.paymentMethod is string && data.paymentMethod.size() <= 20 &&
+        data.date is string && data.date.size() <= 40 &&
+        data.localUpdatedAt is string && data.localUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalString(data, 'notes', 400);
+    }
+
+    function isValidCloudCashbook(data, userId, entryId) {
+      return data.keys().hasAll(['id', 'ownerId', 'date', 'type', 'category', 'amount', 'localUpdatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'date', 'type', 'category', 'description', 'amount',
+          'paymentMode', 'refType', 'refId', 'localUpdatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && isValidId(data.id) && data.id == entryId &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.date is string && data.date.size() <= 40 &&
+        data.type in ['IN', 'OUT'] &&
+        data.category is string && data.category.size() <= 64 &&
+        data.amount is number &&
+        data.localUpdatedAt is string && data.localUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalString(data, 'description', 400) &&
+        isOptionalString(data, 'paymentMode', 20) &&
+        isOptionalString(data, 'refType', 40) &&
+        isOptionalString(data, 'refId', 128);
+    }
+
+    function isValidCloudProduct(data, userId, productId) {
+      return data.keys().hasAll(['id', 'ownerId', 'name', 'unit', 'costPrice', 'sellingPrice', 'stockQty', 'localUpdatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'name', 'category', 'unit', 'costPrice', 'sellingPrice', 'mrp',
+          'stockQty', 'minStockAlert', 'preferredSupplierId', 'preferredSupplierName',
+          'isArchived', 'localUpdatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && isValidId(data.id) && data.id == productId &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 180 &&
+        data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 32 &&
+        data.costPrice is number &&
+        data.sellingPrice is number &&
+        data.stockQty is number &&
+        data.localUpdatedAt is string && data.localUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalString(data, 'category', 80) &&
+        isOptionalNumber(data, 'mrp') &&
+        isOptionalNumber(data, 'minStockAlert') &&
+        isOptionalString(data, 'preferredSupplierId', 128) &&
+        isOptionalString(data, 'preferredSupplierName', 160) &&
+        isOptionalBool(data, 'isArchived');
+    }
+
+    function isValidCloudBackupManifest(data, userId, backupId) {
+      return data.keys().hasAll(['id', 'ownerId', 'bucket', 'trigger', 'checksum', 'totalTransactions', 'localCreatedAt', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'bucket', 'trigger', 'checksum', 'sizeBytes', 'totalTransactions',
+          'salesCount', 'customersCount', 'productsCount', 'localCreatedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && isValidId(data.id) && data.id == backupId &&
+        data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId &&
+        data.bucket in ['DAILY', 'WEEKLY', 'MANUAL'] &&
+        data.trigger in ['AUTO_INTERVAL', 'AUTO_BATCH', 'MANUAL', 'PRE_RESTORE'] &&
+        data.checksum is string && data.checksum.size() >= 1 && data.checksum.size() <= 128 &&
+        data.totalTransactions is number &&
+        data.localCreatedAt is string && data.localCreatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isOptionalNumber(data, 'sizeBytes') &&
+        isOptionalNumber(data, 'salesCount') &&
+        isOptionalNumber(data, 'customersCount') &&
+        isOptionalNumber(data, 'productsCount');
+    }
+
+    // Root Store Workspace & Subcollections
+    match /stores/{userId} {
+      allow get: if isStoreOwner(userId) && isValidId(userId) && (resource == null || existing().ownerId == request.auth.uid);
+      allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+      allow create: if isStoreOwner(userId) && isValidId(userId) &&
+        isValidStoreWorkspace(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isStoreOwner(userId) && isValidId(userId) &&
+        isValidStoreWorkspace(incoming(), userId) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'storeName', 'ownerName', 'phone', 'address', 'upiId', 'gstin',
+          'lastClosedDate', 'whatsappTemplateConfig', 'localUpdatedAt', 'updatedAt'
+        ]);
+      allow delete: if false;
+
+      match /customers/{customerId} {
+        allow get: if isStoreOwner(userId) && isValidId(customerId) && storeParentValid(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isStoreOwner(userId) && isValidId(customerId) &&
+          isValidCloudCustomer(incoming(), userId, customerId) &&
+          storeParentValid(userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isStoreOwner(userId) && isValidId(customerId) &&
+          isValidCloudCustomer(incoming(), userId, customerId) &&
+          storeParentValid(userId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'phone', 'address', 'openingBalance', 'currentBalance',
+            'totalCreditGiven', 'totalPaymentReceived', 'whatsappConsent', 'localUpdatedAt', 'updatedAt'
+          ]);
+        allow delete: if isStoreOwner(userId) && isValidId(customerId) && storeParentValid(userId) && existing().ownerId == request.auth.uid;
+      }
+
+      match /customerTransactions/{txId} {
+        allow get: if isStoreOwner(userId) && isValidId(txId) && storeParentValid(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isStoreOwner(userId) && isValidId(txId) &&
+          isValidCloudCustomerTx(incoming(), userId, txId) &&
+          storeParentValid(userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isStoreOwner(userId) && isValidId(txId) &&
+          isValidCloudCustomerTx(incoming(), userId, txId) &&
+          storeParentValid(userId) &&
+          isNotCancelled(existing()) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'description', 'paymentMethod', 'invoiceNo', 'status', 'localUpdatedAt', 'updatedAt'
+          ]);
+        allow delete: if false;
+      }
+
+      match /suppliers/{supplierId} {
+        allow get: if isStoreOwner(userId) && isValidId(supplierId) && storeParentValid(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isStoreOwner(userId) && isValidId(supplierId) &&
+          isValidCloudSupplier(incoming(), userId, supplierId) &&
+          storeParentValid(userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isStoreOwner(userId) && isValidId(supplierId) &&
+          isValidCloudSupplier(incoming(), userId, supplierId) &&
+          storeParentValid(userId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'phone', 'category', 'address', 'openingBalance', 'currentBalance',
+            'totalPurchases', 'totalPaid', 'localUpdatedAt', 'updatedAt'
+          ]);
+        allow delete: if isStoreOwner(userId) && isValidId(supplierId) && storeParentValid(userId) && existing().ownerId == request.auth.uid;
+      }
+
+      match /supplierTransactions/{txId} {
+        allow get: if isStoreOwner(userId) && isValidId(txId) && storeParentValid(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isStoreOwner(userId) && isValidId(txId) &&
+          isValidCloudSupplierTx(incoming(), userId, txId) &&
+          storeParentValid(userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isStoreOwner(userId) && isValidId(txId) &&
+          isValidCloudSupplierTx(incoming(), userId, txId) &&
+          storeParentValid(userId) &&
+          isNotCancelled(existing()) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'paymentStatus', 'paymentMethod', 'description', 'invoiceNo', 'status', 'localUpdatedAt', 'updatedAt'
+          ]);
+        allow delete: if false;
+      }
+
+      match /sales/{saleId} {
+        allow get: if isStoreOwner(userId) && isValidId(saleId) && storeParentValid(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isStoreOwner(userId) && isValidId(saleId) &&
+          isValidCloudSale(incoming(), userId, saleId) &&
+          storeParentValid(userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isStoreOwner(userId) && isValidId(saleId) &&
+          isValidCloudSale(incoming(), userId, saleId) &&
+          storeParentValid(userId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'notes', 'paymentMethod', 'customerId', 'customerName', 'localUpdatedAt', 'updatedAt'
+          ]);
+        allow delete: if false;
+      }
+
+      match /expenses/{expenseId} {
+        allow get: if isStoreOwner(userId) && isValidId(expenseId) && storeParentValid(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isStoreOwner(userId) && isValidId(expenseId) &&
+          isValidCloudExpense(incoming(), userId, expenseId) &&
+          storeParentValid(userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isStoreOwner(userId) && isValidId(expenseId) &&
+          isValidCloudExpense(incoming(), userId, expenseId) &&
+          storeParentValid(userId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'category', 'amount', 'isPersonalWithdrawal', 'paymentMethod', 'date', 'notes', 'localUpdatedAt', 'updatedAt'
+          ]);
+        allow delete: if isStoreOwner(userId) && isValidId(expenseId) && storeParentValid(userId) && existing().ownerId == request.auth.uid;
+      }
+
+      match /cashbookEntries/{entryId} {
+        allow get: if isStoreOwner(userId) && isValidId(entryId) && storeParentValid(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isStoreOwner(userId) && isValidId(entryId) &&
+          isValidCloudCashbook(incoming(), userId, entryId) &&
+          storeParentValid(userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isStoreOwner(userId) && isValidId(entryId) &&
+          isValidCloudCashbook(incoming(), userId, entryId) &&
+          storeParentValid(userId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'description', 'category', 'amount', 'localUpdatedAt', 'updatedAt'
+          ]);
+        allow delete: if false;
+      }
+
+      match /products/{productId} {
+        allow get: if isStoreOwner(userId) && isValidId(productId) && storeParentValid(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isStoreOwner(userId) && isValidId(productId) &&
+          isValidCloudProduct(incoming(), userId, productId) &&
+          storeParentValid(userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isStoreOwner(userId) && isValidId(productId) &&
+          isValidCloudProduct(incoming(), userId, productId) &&
+          storeParentValid(userId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'category', 'unit', 'costPrice', 'sellingPrice', 'mrp', 'stockQty',
+            'minStockAlert', 'preferredSupplierId', 'preferredSupplierName', 'isArchived',
+            'localUpdatedAt', 'updatedAt'
+          ]);
+        allow delete: if isStoreOwner(userId) && isValidId(productId) && storeParentValid(userId) && existing().ownerId == request.auth.uid;
+      }
+
+      match /backupManifests/{backupId} {
+        allow get: if isStoreOwner(userId) && isValidId(backupId) && storeParentValid(userId) && (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isStoreOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isStoreOwner(userId) && isValidId(backupId) &&
+          isValidCloudBackupManifest(incoming(), userId, backupId) &&
+          storeParentValid(userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if false;
+        allow delete: if isStoreOwner(userId) && isValidId(backupId) && storeParentValid(userId) && existing().ownerId == request.auth.uid;
+      }
+    }
+  }
+}

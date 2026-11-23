@@ -1,0 +1,85 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  body {
+    background-color: #f8fafc;
+    color: #0f172a;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .dark body {
+    background-color: #0b1120;
+    color: #f1f5f9;
+  }
+}
+
+@layer components {
+  .press-scale,
+  button[class*="bg-emerald-700"],
+  button[class*="bg-emerald-600"],
+  button[class*="bg-emerald-500"],
+  button[class*="bg-red-600"],
+  button[type="submit"]:not(:disabled) {
+    transition:
+      transform 140ms cubic-bezier(0.16, 1, 0.3, 1),
+      background-color 150ms ease,
+      border-color 150ms ease,
+      box-shadow 150ms ease,
+      opacity 150ms ease;
+    transform-origin: center;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .press-scale:active:not(:disabled),
+  button[class*="bg-emerald-700"]:active:not(:disabled),
+  button[class*="bg-emerald-600"]:active:not(:disabled),
+  button[class*="bg-emerald-500"]:active:not(:disabled),
+  button[class*="bg-red-600"]:active:not(:disabled),
+  button[type="submit"]:active:not(:disabled) {
+    transform: scale(0.96);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .press-scale,
+    button[class*="bg-emerald-700"],
+    button[class*="bg-emerald-600"],
+    button[class*="bg-emerald-500"],
+    button[class*="bg-red-600"],
+    button[type="submit"]:not(:disabled) {
+      transition: background-color 150ms ease, border-color 150ms ease, opacity 150ms ease;
+    }
+
+    .press-scale:active:not(:disabled),
+    button[class*="bg-emerald-700"]:active:not(:disabled),
+    button[class*="bg-emerald-600"]:active:not(:disabled),
+    button[class*="bg-emerald-500"]:active:not(:disabled),
+    button[class*="bg-red-600"]:active:not(:disabled),
+    button[type="submit"]:active:not(:disabled) {
+      transform: none;
+    }
+  }
+}
+
+/* Print optimizations for thermal bills and A4 statements */
+@media print {
+  aside,
+  header,
+  nav,
+  button,
+  .no-print {
+    display: none !important;
+  }
+
+  body {
+    background-color: white !important;
+    color: black !important;
+  }
+
+  main {
+    padding: 0 !important;
+    margin: 0 !important;
+    max-width: 100% !important;
+  }
+}

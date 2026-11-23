@@ -1,0 +1,6 @@
+{
+  "name": "Arjun Groceries - Store Management & Udhar Ledger",
+  "description": "Arjun Groceries — Shop Smart • Save More. Offline-first store management with digital udhar ledger, cashbook, inventory, daily sales, supplier accounts, and encrypted local backups.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

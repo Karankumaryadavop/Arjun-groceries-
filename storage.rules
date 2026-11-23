@@ -1,0 +1,64 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedInVerifiedOwner(userId) {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.uid == userId;
+    }
+
+    function isValidBackupBucket(bucketType) {
+      return bucketType in ['daily', 'weekly', 'manual', 'pre-restore'];
+    }
+
+    function isValidBackupFileName(fileName) {
+      return fileName.matches('^backup-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-[a-z0-9]{6,20}\\.skbackup\\.json$')
+        || fileName.matches('^backup-[0-9]{4}-W[0-9]{2}-[0-9]{6}-[a-z0-9]{6,20}\\.skbackup\\.json$');
+    }
+
+    function hasNoSensitiveCustomMetadata() {
+      return !('storeName' in request.resource.metadata)
+        && !('ownerName' in request.resource.metadata)
+        && !('phone' in request.resource.metadata)
+        && !('totalSales' in request.resource.metadata)
+        && !('customers' in request.resource.metadata)
+        && !('recordCounts' in request.resource.metadata);
+    }
+
+    function isValidEncryptedBackupUpload() {
+      return request.resource != null
+        && request.resource.size > 0
+        && request.resource.size <= 50 * 1024 * 1024
+        && request.resource.contentType == 'application/json'
+        && request.resource.metadata != null
+        && request.resource.metadata.format == 'SKPRO_ENC_V1'
+        && request.resource.metadata.cipher == 'AES-256-GCM'
+        && request.resource.metadata.ciphertextSha256 is string
+        && request.resource.metadata.ciphertextSha256.matches('^[a-f0-9]{64}$')
+        && hasNoSensitiveCustomMetadata();
+    }
+
+    // Single-owner encrypted backup isolation: read/write strictly scoped to authenticated owner's UID.
+    // Backups are immutable create-only archives; updates are forbidden and manual/pre-restore backups cannot be pruned/deleted.
+    match /users/{userId}/backups/{bucketType}/{fileName} {
+      allow get, list: if isSignedInVerifiedOwner(userId)
+        && isValidBackupBucket(bucketType);
+
+      allow create: if isSignedInVerifiedOwner(userId)
+        && isValidBackupBucket(bucketType)
+        && isValidBackupFileName(fileName)
+        && isValidEncryptedBackupUpload();
+
+      allow update: if false;
+
+      allow delete: if isSignedInVerifiedOwner(userId)
+        && bucketType in ['daily', 'weekly'];
+    }
+
+    // Deny all other paths by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
