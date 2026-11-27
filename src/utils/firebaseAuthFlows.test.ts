@@ -5,6 +5,8 @@ import {
   maskEmailForNotice,
   evaluatePasswordStrength,
   validateStoreRegistrationInput,
+  validateEmailPasswordSignInInput,
+  validateEmailPasswordSignUpInput,
   resolvePasswordResetIdentifier,
   mapFirebaseAuthErrorToMessage,
   STORE_WORKSPACE_LIMITS,
@@ -121,6 +123,79 @@ test('validateStoreRegistrationInput enforces blueprint limits and password/PIN 
   assert.equal(validGoogleSignup.data?.email, undefined);
 });
 
+test('validateEmailPasswordSignInInput validates and normalizes sign-in credentials', () => {
+  assert.equal(validateEmailPasswordSignInInput({ email: '', password: 'Password1!' }).valid, false);
+  assert.equal(validateEmailPasswordSignInInput({ email: 'bad-email', password: 'Password1!' }).valid, false);
+  assert.equal(validateEmailPasswordSignInInput({ email: 'owner@example.com', password: '' }).valid, false);
+  assert.equal(validateEmailPasswordSignInInput({ email: 'owner@example.com', password: '123' }).valid, false);
+
+  const valid = validateEmailPasswordSignInInput({
+    email: '  Owner@Example.COM ',
+    password: 'Password1!',
+  });
+  assert.equal(valid.valid, true);
+  assert.equal(valid.data?.email, 'owner@example.com');
+  assert.equal(valid.data?.password, 'Password1!');
+});
+
+test('validateEmailPasswordSignUpInput validates required fields and optional store details', () => {
+  const validMinimal = validateEmailPasswordSignUpInput({
+    storeName: 'Arjun Groceries',
+    ownerName: 'Arjun Sharma',
+    email: ' Owner@Example.COM ',
+    password: 'Password1!',
+    confirmPassword: 'Password1!',
+  });
+  assert.equal(validMinimal.valid, true);
+  assert.equal(validMinimal.data?.email, 'owner@example.com');
+  assert.equal(validMinimal.data?.normalizedMobile, undefined);
+
+  const validFull = validateEmailPasswordSignUpInput({
+    storeName: 'Arjun Groceries',
+    ownerName: 'Arjun Sharma',
+    email: 'owner@example.com',
+    password: 'Password1!',
+    confirmPassword: 'Password1!',
+    mobile: '+91 98765 43210',
+    address: '14 Market Road',
+    upiId: 'arjun@okicici',
+    gstin: '27aabcs1429b1z5',
+  });
+  assert.equal(validFull.valid, true);
+  assert.equal(validFull.data?.normalizedMobile, '9876543210');
+  assert.equal(validFull.data?.gstin, '27AABCS1429B1Z5');
+
+  const mismatched = validateEmailPasswordSignUpInput({
+    storeName: 'Arjun Groceries',
+    ownerName: 'Arjun Sharma',
+    email: 'owner@example.com',
+    password: 'Password1!',
+    confirmPassword: 'DifferentPassword1!',
+  });
+  assert.equal(mismatched.valid, false);
+  assert.match(mismatched.error || '', /do not match/i);
+
+  const invalidMobile = validateEmailPasswordSignUpInput({
+    storeName: 'Arjun Groceries',
+    ownerName: 'Arjun Sharma',
+    email: 'owner@example.com',
+    password: 'Password1!',
+    confirmPassword: 'Password1!',
+    mobile: '12345',
+  });
+  assert.equal(invalidMobile.valid, false);
+  assert.match(invalidMobile.error || '', /10-digit/i);
+
+  const shortStore = validateEmailPasswordSignUpInput({
+    storeName: 'A',
+    ownerName: 'Arjun Sharma',
+    email: 'owner@example.com',
+    password: 'Password1!',
+    confirmPassword: 'Password1!',
+  });
+  assert.equal(shortStore.valid, false);
+});
+
 test('resolvePasswordResetIdentifier handles direct emails and registered mobile numbers safely', () => {
   const direct = resolvePasswordResetIdentifier({
     input: '  Owner@ArjunGroceries.in ',
@@ -165,4 +240,38 @@ test('mapFirebaseAuthErrorToMessage maps Firebase Auth error codes cleanly', () 
 
   const rateLimited = mapFirebaseAuthErrorToMessage({ code: 'auth/too-many-requests' });
   assert.match(rateLimited.message, /Too many requests/i);
+
+  for (const code of [
+    'auth/invalid-credential',
+    'auth/wrong-password',
+    'auth/user-not-found',
+    'auth/invalid-login-credentials',
+  ]) {
+    const mapped = mapFirebaseAuthErrorToMessage({ code });
+    assert.match(mapped.message, /Invalid email or password/i);
+  }
+
+  const userDisabled = mapFirebaseAuthErrorToMessage({ code: 'auth/user-disabled' });
+  assert.match(userDisabled.message, /disabled/i);
+
+  assert.match(
+    mapFirebaseAuthErrorToMessage({ code: 'auth/popup-closed-by-user' }).message,
+    /closed/i
+  );
+  assert.match(
+    mapFirebaseAuthErrorToMessage({ code: 'auth/cancelled-popup-request' }).message,
+    /already open/i
+  );
+  assert.match(
+    mapFirebaseAuthErrorToMessage({ code: 'auth/popup-blocked' }).message,
+    /blocked/i
+  );
+  assert.match(
+    mapFirebaseAuthErrorToMessage({ code: 'auth/unauthorized-domain' }).message,
+    /Authorized domains/i
+  );
+  assert.match(
+    mapFirebaseAuthErrorToMessage({ code: 'auth/account-exists-with-different-credential' }).message,
+    /Email & Password/i
+  );
 });

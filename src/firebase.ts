@@ -4,49 +4,71 @@
  */
 
 import { initializeApp, getApps } from 'firebase/app';
+import { Analytics, getAnalytics, isSupported as isAnalyticsSupported } from 'firebase/analytics';
 import {
   Auth,
   browserLocalPersistence,
-  browserPopupRedirectResolver,
   createUserWithEmailAndPassword,
   getAuth,
-  getRedirectResult,
   GoogleAuthProvider,
   indexedDBLocalPersistence,
   initializeAuth,
   onAuthStateChanged,
+  reload as reloadFirebaseUser,
   sendEmailVerification,
   sendPasswordResetEmail,
   setPersistence,
+  signInWithEmailAndPassword,
   signInWithPopup,
-  signInWithRedirect,
   signOut,
   updateProfile as updateFirebaseProfile,
   User,
 } from 'firebase/auth';
-import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
-import { getStorage } from 'firebase/storage';
-import firebaseConfig from '../firebase-applet-config.json';
+import { doc, Firestore, getDocFromServer, getFirestore } from 'firebase/firestore';
 import { CloudAuthUser } from './types';
 
-const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
+// Arjun Groceries Firebase Web SDK configuration (Firebase Auth + Cloud Firestore + Analytics)
+export const firebaseConfig = {
+  apiKey: 'AIzaSyDF8b9ua3lTbQtg7dCGykGuo5Xvm1ptaK0',
+  authDomain: 'arjun-groceries.firebaseapp.com',
+  projectId: 'arjun-groceries',
+  storageBucket: 'arjun-groceries.firebasestorage.app',
+  messagingSenderId: '206303757333',
+  appId: '1:206303757333:web:8006b924319e66fab9fa1c',
+  measurementId: 'G-KF1VWTFE5C',
+};
+
+// Initialize Firebase
+export const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
+
+// Initialize Cloud Firestore against the project's default database
+export const db: Firestore = getFirestore(app);
+
+// Initialize Firebase Analytics safely in supported browser environments only
+export let analytics: Analytics | null = null;
+if (typeof window !== 'undefined') {
+  void isAnalyticsSupported()
+    .then((supported) => {
+      if (supported) {
+        analytics = getAnalytics(app);
+      }
+    })
+    .catch(() => {
+      analytics = null;
+    });
+}
 
 function initPersistentFirebaseAuth(): Auth {
   try {
     return initializeAuth(app, {
       persistence: [browserLocalPersistence, indexedDBLocalPersistence],
-      popupRedirectResolver: browserPopupRedirectResolver,
     });
   } catch {
     return getAuth(app);
   }
 }
 
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = initPersistentFirebaseAuth();
-export const storage = getStorage(app);
-export const googleProvider = new GoogleAuthProvider();
-googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 let persistenceReadyPromise: Promise<void> | null = null;
 
@@ -92,6 +114,9 @@ export interface FirestoreErrorInfo {
   };
 }
 
+/**
+ * Structured Firestore error handler providing rich auth & path context for diagnosis.
+ */
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
@@ -118,17 +143,28 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
-export async function testFirestoreConnection(): Promise<boolean> {
+let connectionTested = false;
+
+/**
+ * Startup connectivity check against Cloud Firestore (`getDocFromServer`).
+ * Logs a clear diagnostic only if the Firestore client reports being offline/misconfigured.
+ * Expected `permission-denied` or `not-found` responses confirm the backend is reachable.
+ */
+export async function testFirestoreConnection(): Promise<{ reachable: boolean; offline?: boolean }> {
+  if (connectionTested) {
+    return { reachable: true };
+  }
+  connectionTested = true;
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
-    return true;
+    return { reachable: true };
   } catch (error) {
     if (error instanceof Error && error.message.includes('the client is offline')) {
       console.error('Please check your Firebase configuration.');
-      return false;
+      return { reachable: false, offline: true };
     }
-    // Permission denied or missing test doc still confirms server reachability
-    return true;
+    // Permission denied / not found proves the Firestore server responded
+    return { reachable: true };
   }
 }
 
@@ -158,84 +194,71 @@ export function subscribeToFirebaseAuth(
 }
 
 /**
- * Awaits Firebase persistence setup and official `auth.authStateReady()` so the
- * persisted `browserLocalPersistence` Firebase user is restored before rendering routes.
- * Redirect results are checked opportunistically without stalling offline startup.
+ * Awaits Firebase persistence setup and `auth.authStateReady()` so the
+ * persisted Firebase Auth user is restored before rendering routes.
  */
 export async function waitForFirebaseAuthReady(): Promise<CloudAuthUser | null> {
   await ensureFirebaseAuthPersistence();
   if (typeof auth.authStateReady === 'function') {
     await auth.authStateReady();
   }
-  const redirectedUser = await Promise.race<CloudAuthUser | null>([
-    consumeFirebaseRedirectAuthResult().catch(() => null),
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), 350)),
-  ]);
-  return redirectedUser ?? toCloudAuthUser(auth.currentUser);
-}
-
-export async function consumeFirebaseRedirectAuthResult(): Promise<CloudAuthUser | null> {
-  try {
-    const res = await getRedirectResult(auth);
-    if (!res?.user) return null;
-    if (!res.user.emailVerified) {
-      await signOut(auth);
-      throw new Error('Your Google account email must be verified before enabling Cloud Backup.');
-    }
-    return toCloudAuthUser(res.user);
-  } catch (err) {
-    const code = (err as { code?: string })?.code;
-    if (code === 'auth/no-auth-event') return null;
-    throw err;
-  }
-}
-
-export async function signInWithGoogleForSync() {
-  await ensureFirebaseAuthPersistence();
-  return signInWithPopup(auth, googleProvider);
-}
-
-export async function signInWithGoogleForCloudBackup(): Promise<{
-  user: CloudAuthUser | null;
-  redirectStarted?: boolean;
-}> {
-  try {
-    await ensureFirebaseAuthPersistence();
-    const cred = await signInWithPopup(auth, googleProvider);
-    if (!cred.user.emailVerified) {
-      await signOut(auth);
-      throw new Error('Google account email is not verified. Please use a verified Google account.');
-    }
-    return { user: toCloudAuthUser(cred.user) };
-  } catch (err) {
-    const code = (err as { code?: string })?.code;
-    if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
-      await ensureFirebaseAuthPersistence();
-      await signInWithRedirect(auth, googleProvider);
-      return { user: null, redirectStarted: true };
-    }
-    throw err;
-  }
-}
-
-export async function signOutFirebaseSync() {
-  return signOut(auth);
+  return toCloudAuthUser(auth.currentUser);
 }
 
 /**
- * Registers a new store owner with Firebase Auth Email/Password, sets their display name,
- * and triggers an email verification link so Firestore rules (`email_verified == true`) can activate cleanly.
+ * Signs in an existing user with Firebase Authentication (Email & Password).
+ */
+export async function signInWithFirebaseEmailPassword(params: {
+  email: string;
+  password: string;
+}): Promise<CloudAuthUser> {
+  await ensureFirebaseAuthPersistence();
+  const cred = await signInWithEmailAndPassword(
+    auth,
+    params.email.trim().toLowerCase(),
+    params.password
+  );
+  const cloudUser = toCloudAuthUser(cred.user);
+  if (!cloudUser) {
+    throw new Error('Signed in with Firebase, but the user profile could not be read.');
+  }
+  return cloudUser;
+}
+
+/**
+ * Signs in or signs up a user via Firebase Authentication with Google (`signInWithPopup`).
+ */
+export async function signInWithFirebaseGoogle(): Promise<CloudAuthUser> {
+  await ensureFirebaseAuthPersistence();
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
+  const cred = await signInWithPopup(auth, provider);
+  const cloudUser = toCloudAuthUser(cred.user);
+  if (!cloudUser) {
+    throw new Error('Signed in with Google, but the user profile could not be read.');
+  }
+  return cloudUser;
+}
+
+/**
+ * Registers a new user with Firebase Authentication (Email & Password),
+ * updates their display name, and optionally sends a verification email.
  */
 export async function registerFirebaseEmailOwnerAccount(params: {
   email: string;
   password: string;
-  displayName: string;
+  displayName?: string;
 }): Promise<{ user: CloudAuthUser; verificationEmailSent: boolean }> {
   await ensureFirebaseAuthPersistence();
-  const cred = await createUserWithEmailAndPassword(auth, params.email, params.password);
-  if (params.displayName.trim()) {
+  const cred = await createUserWithEmailAndPassword(
+    auth,
+    params.email.trim().toLowerCase(),
+    params.password
+  );
+  const trimmedName = (params.displayName || '').trim();
+  if (trimmedName) {
     try {
-      await updateFirebaseProfile(cred.user, { displayName: params.displayName.trim() });
+      await updateFirebaseProfile(cred.user, { displayName: trimmedName });
     } catch {
       // Non-blocking profile display name update
     }
@@ -246,7 +269,7 @@ export async function registerFirebaseEmailOwnerAccount(params: {
       await sendEmailVerification(cred.user);
       verificationEmailSent = true;
     } catch {
-      // Allow registration flow to proceed even if verification email delivery is throttled
+      // Allow sign-up flow to proceed even if verification email delivery is throttled
     }
   }
   const cloudUser = toCloudAuthUser(cred.user);
@@ -257,7 +280,29 @@ export async function registerFirebaseEmailOwnerAccount(params: {
 }
 
 /**
- * Triggers Firebase Auth's official `sendPasswordResetEmail` flow.
+ * Resends the email verification link for the currently signed-in Firebase user.
+ */
+export async function resendFirebaseEmailVerification(): Promise<void> {
+  await ensureFirebaseAuthPersistence();
+  if (!auth.currentUser) {
+    throw new Error('Please sign in first before requesting an email verification link.');
+  }
+  await sendEmailVerification(auth.currentUser);
+}
+
+/**
+ * Reloads the current Firebase user token & profile (e.g. after clicking the email verification link).
+ */
+export async function refreshFirebaseAuthUser(): Promise<CloudAuthUser | null> {
+  await ensureFirebaseAuthPersistence();
+  if (!auth.currentUser) return null;
+  await reloadFirebaseUser(auth.currentUser);
+  await auth.currentUser.getIdToken(true);
+  return toCloudAuthUser(auth.currentUser);
+}
+
+/**
+ * Triggers Firebase Auth's `sendPasswordResetEmail` flow.
  * Treats `auth/user-not-found` as privacy-safe completion to prevent account enumeration.
  */
 export async function sendFirebasePasswordResetEmail(email: string): Promise<{ sent: boolean }> {
@@ -274,6 +319,10 @@ export async function sendFirebasePasswordResetEmail(email: string): Promise<{ s
   }
 }
 
+export async function signOutFirebaseAuth(): Promise<void> {
+  return signOut(auth);
+}
+
+export const signOutFirebaseSync = signOutFirebaseAuth;
+
 export const FIREBASE_PROJECT_ID = firebaseConfig.projectId;
-export const FIREBASE_DATABASE_ID = firebaseConfig.firestoreDatabaseId;
-export const FIREBASE_STORAGE_BUCKET = firebaseConfig.storageBucket;

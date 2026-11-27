@@ -85,7 +85,7 @@ define(['./workbox-effb642e'], (function (workbox) { 'use strict';
    */
   workbox.precacheAndRoute([{
     "url": "/index.html",
-    "revision": "0.s7a0fo1vea8"
+    "revision": "0.sr3atv60ai8"
   }], {});
   workbox.cleanupOutdatedCaches();
   workbox.registerRoute(new workbox.NavigationRoute(workbox.createHandlerBoundToURL("/index.html"), {
@@ -93,7 +93,7 @@ define(['./workbox-effb642e'], (function (workbox) { 'use strict';
     denylist: [/^\/api\//, /^\/__\//, /^\/offline\.html$/]
   }));
   workbox.registerRoute(/^\/api\/.*/i, new workbox.NetworkOnly(), 'GET');
-  workbox.registerRoute(/^https:\/\/(.*\.)?(googleapis\.com|firebaseio\.com|firebasestorage\.app|firebaseapp\.com|identitytoolkit\.googleapis\.com|securetoken\.googleapis\.com)\/.*/i, new workbox.NetworkOnly(), 'GET');
+  workbox.registerRoute(/^https:\/\/(?!firestore\.googleapis\.com)(.*\.)?(googleapis\.com|firebaseio\.com|firebasestorage\.app|firebaseapp\.com|identitytoolkit\.googleapis\.com|securetoken\.googleapis\.com)\/.*/i, new workbox.NetworkOnly(), 'GET');
   workbox.registerRoute(/^https:\/\/graph\.facebook\.com\/.*/i, new workbox.NetworkOnly(), 'GET');
 
 }));

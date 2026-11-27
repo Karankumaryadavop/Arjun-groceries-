@@ -66,7 +66,7 @@ export default defineConfig(() => {
             },
             {
               urlPattern:
-                /^https:\/\/(.*\.)?(googleapis\.com|firebaseio\.com|firebasestorage\.app|firebaseapp\.com|identitytoolkit\.googleapis\.com|securetoken\.googleapis\.com)\/.*/i,
+                /^https:\/\/(?!firestore\.googleapis\.com)(.*\.)?(googleapis\.com|firebaseio\.com|firebasestorage\.app|firebaseapp\.com|identitytoolkit\.googleapis\.com|securetoken\.googleapis\.com)\/.*/i,
               handler: 'NetworkOnly',
             },
             {

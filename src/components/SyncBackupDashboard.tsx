@@ -28,6 +28,9 @@ import { ExternalRecoveryGuide } from './ExternalRecoveryGuide';
 import {
   AlertTriangle,
   CheckCircle2,
+  Cloud,
+  CloudDownload,
+  CloudUpload,
   Database,
   Download,
   ExternalLink,
@@ -39,6 +42,8 @@ import {
   History,
   Info,
   Lock,
+  Mail,
+  RefreshCw,
   RotateCcw,
   Share2,
   ShieldAlert,
@@ -97,6 +102,12 @@ export const SyncBackupDashboard: React.FC = () => {
     updateAutoBackupSettings,
     getBackupSummary,
     purgeLegacyLocalStorageArchive,
+    cloudAuthUser,
+    firestoreSyncStatus,
+    syncNowToFirestore,
+    pullFromFirestore,
+    resendEmailVerification,
+    refreshEmailVerificationStatus,
   } = useStore();
 
   const [statusBanner, setStatusBanner] = useState<{
@@ -105,7 +116,10 @@ export const SyncBackupDashboard: React.FC = () => {
     verifiedCounts?: VerifiedRestoreCounts;
   } | null>(null);
   const [isBusy, setIsBusy] = useState(false);
-  useTrackActiveTransaction('local-backup-busy', isBusy);
+  const [firestoreActionBusy, setFirestoreActionBusy] = useState(false);
+  const [confirmPullFromCloud, setConfirmPullFromCloud] = useState(false);
+  const [verificationMsg, setVerificationMsg] = useState<string | null>(null);
+  useTrackActiveTransaction('local-backup-busy', isBusy || firestoreActionBusy);
   const [encryptionPassphrase, setEncryptionPassphrase] = useState('');
   const [confirmLegacyPurge, setConfirmLegacyPurge] = useState(false);
 
@@ -434,11 +448,13 @@ export const SyncBackupDashboard: React.FC = () => {
               Arjun Groceries · Backup, PDF/Excel Reports &amp; Local Database
             </h3>
             <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
-              Single-Phone Local Only
+              {storageStatus.cloudSyncConfigured
+                ? 'Local-First + Cloud Firestore'
+                : 'Single-Phone Local Only'}
             </span>
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            IndexedDB ({storageStatus.dbName} v{storageStatus.dbVersion}) is the single source of truth for all records and bill attachments.
+            IndexedDB ({storageStatus.dbName} v{storageStatus.dbVersion}) keeps all records fast offline, synced with Cloud Firestore ({firestoreSyncStatus.projectId}).
           </p>
         </div>
 
@@ -618,6 +634,264 @@ export const SyncBackupDashboard: React.FC = () => {
             {summary.customersCount} Cust · {summary.productsCount} Items
           </div>
         </div>
+      </div>
+
+      {/* Cloud Firestore Database Sync Section */}
+      <div
+        data-testid="firestore-sync-card"
+        className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-3"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="flex items-start gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-emerald-100 dark:bg-emerald-950/70 border border-emerald-200 dark:border-emerald-800 flex items-center justify-center text-emerald-700 dark:text-emerald-400 shrink-0">
+              <Cloud className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h4 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                  Cloud Firestore Database
+                </h4>
+                <span
+                  data-testid="firestore-sync-badge"
+                  className={`px-2 py-0.5 rounded-full text-[11px] font-bold border ${
+                    firestoreSyncStatus.state === 'SYNCED'
+                      ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                      : firestoreSyncStatus.state === 'SYNCING'
+                      ? 'bg-sky-50 dark:bg-sky-950/60 text-sky-800 dark:text-sky-300 border-sky-200 dark:border-sky-800'
+                      : firestoreSyncStatus.state === 'NEEDS_VERIFICATION'
+                      ? 'bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+                      : firestoreSyncStatus.state === 'ERROR'
+                      ? 'bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border-red-200 dark:border-red-800'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {firestoreSyncStatus.state === 'SYNCED'
+                    ? 'Synced'
+                    : firestoreSyncStatus.state === 'SYNCING'
+                    ? 'Syncing...'
+                    : firestoreSyncStatus.state === 'NEEDS_VERIFICATION'
+                    ? 'Verify Email'
+                    : firestoreSyncStatus.state === 'ERROR'
+                    ? 'Sync Error'
+                    : cloudAuthUser
+                    ? 'Connected'
+                    : 'Sign In Needed'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
+                Project: <strong className="font-semibold">{firestoreSyncStatus.projectId}</strong>
+                {cloudAuthUser?.email ? ` · Account: ${cloudAuthUser.email}` : ' · Sign in with Email or Google to sync'}
+                {firestoreSyncStatus.lastSyncedAt
+                  ? ` · Last synced ${new Date(firestoreSyncStatus.lastSyncedAt).toLocaleTimeString('en-IN', {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    })}`
+                  : ''}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              type="button"
+              data-testid="firestore-sync-now-btn"
+              disabled={
+                firestoreActionBusy ||
+                firestoreSyncStatus.state === 'SYNCING' ||
+                !cloudAuthUser?.uid ||
+                !storageStatus.isOnline
+              }
+              onClick={async () => {
+                setFirestoreActionBusy(true);
+                setVerificationMsg(null);
+                try {
+                  const res = await syncNowToFirestore();
+                  if (res.success) {
+                    setStatusBanner({
+                      type: 'success',
+                      message: `Synced store records to Cloud Firestore (${firestoreSyncStatus.projectId}).`,
+                    });
+                  } else if (res.error) {
+                    setStatusBanner({ type: 'error', message: res.error });
+                  }
+                } finally {
+                  setFirestoreActionBusy(false);
+                }
+              }}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold bg-[#0d7f1f] hover:bg-[#086917] disabled:opacity-50 text-white shadow-xs transition-colors cursor-pointer"
+            >
+              <CloudUpload className="w-3.5 h-3.5" />
+              <span>
+                {firestoreSyncStatus.state === 'SYNCING' ? 'Syncing...' : 'Sync to Firestore'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              data-testid="firestore-pull-btn"
+              disabled={
+                firestoreActionBusy ||
+                firestoreSyncStatus.state === 'SYNCING' ||
+                !cloudAuthUser?.uid ||
+                !storageStatus.isOnline
+              }
+              onClick={() => setConfirmPullFromCloud((v) => !v)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold bg-white hover:bg-slate-100 disabled:opacity-50 dark:bg-slate-900 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-100 border border-slate-300 dark:border-slate-600 transition-colors cursor-pointer"
+            >
+              <CloudDownload className="w-3.5 h-3.5" />
+              <span>Pull from Cloud</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Email verification prompt for newly created Email/Password accounts */}
+        {cloudAuthUser && !cloudAuthUser.emailVerified && (
+          <div className="p-3 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-xs text-amber-900 dark:text-amber-200 space-y-2">
+            <div className="flex items-start gap-2">
+              <Mail className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+              <span>
+                Verify your email address (<strong>{cloudAuthUser.email}</strong>) to unlock Cloud Firestore sync. Google Sign-In accounts are verified automatically.
+              </span>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                disabled={firestoreActionBusy}
+                onClick={async () => {
+                  setFirestoreActionBusy(true);
+                  try {
+                    const res = await resendEmailVerification();
+                    setVerificationMsg(
+                      res.success
+                        ? 'Verification email sent! Open the link in your inbox, then click Refresh Status.'
+                        : res.error || 'Could not send verification email.'
+                    );
+                  } finally {
+                    setFirestoreActionBusy(false);
+                  }
+                }}
+                className="px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-600 hover:bg-amber-700 text-white cursor-pointer"
+              >
+                Resend Verification Email
+              </button>
+              <button
+                type="button"
+                disabled={firestoreActionBusy}
+                onClick={async () => {
+                  setFirestoreActionBusy(true);
+                  try {
+                    const res = await refreshEmailVerificationStatus();
+                    setVerificationMsg(
+                      res.verified
+                        ? 'Email verified! Cloud Firestore sync is now unlocked.'
+                        : res.error || 'Not verified yet — click the verification link in your inbox first.'
+                    );
+                  } finally {
+                    setFirestoreActionBusy(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-bold bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 text-amber-900 dark:text-amber-200 cursor-pointer"
+              >
+                <RefreshCw className="w-3 h-3" />
+                <span>I&apos;ve Verified — Refresh</span>
+              </button>
+            </div>
+            {verificationMsg && <p className="text-[11px] font-semibold">{verificationMsg}</p>}
+          </div>
+        )}
+
+        {/* Explicit confirmation before pulling cloud records into local store */}
+        {confirmPullFromCloud && (
+          <div className="p-3 rounded-xl bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 text-xs text-sky-950 dark:text-sky-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <span>
+              Pulling from Cloud Firestore replaces your local store records with your cloud data (a local safety snapshot is created first). Continue?
+            </span>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={firestoreActionBusy}
+                onClick={async () => {
+                  setFirestoreActionBusy(true);
+                  try {
+                    const res = await pullFromFirestore();
+                    setConfirmPullFromCloud(false);
+                    if (res.success && res.emptyRemote) {
+                      setStatusBanner({
+                        type: 'info',
+                        message:
+                          'No cloud records found in Firestore yet for this account. Click "Sync to Firestore" to upload your current store data.',
+                      });
+                    } else if (res.success) {
+                      setStatusBanner({
+                        type: 'success',
+                        message: `Pulled store data from Cloud Firestore (${res.counts?.sales ?? 0} sales, ${res.counts?.customers ?? 0} customers, ${res.counts?.products ?? 0} products).`,
+                      });
+                    } else if (res.error) {
+                      setStatusBanner({ type: 'error', message: res.error });
+                    }
+                  } finally {
+                    setFirestoreActionBusy(false);
+                  }
+                }}
+                className="px-3 py-1.5 rounded-lg text-xs font-bold bg-sky-700 hover:bg-sky-800 text-white cursor-pointer"
+              >
+                Confirm Pull
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmPullFromCloud(false)}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-200/70 dark:hover:bg-slate-800 cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Firestore error notice */}
+        {firestoreSyncStatus.lastError && (
+          <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 text-xs text-red-800 dark:text-red-200 space-y-1">
+            <div className="flex items-start gap-2 font-semibold">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+              <span>{firestoreSyncStatus.lastError}</span>
+            </div>
+            {firestoreSyncStatus.permissionDenied && (
+              <p className="text-[11px] text-red-700 dark:text-red-300 pl-6">
+                Open Firebase Console → <strong>arjun-groceries</strong> → Firestore Database → Rules and publish the rules from <code>firestore.rules</code>.
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Synced counts summary */}
+        {firestoreSyncStatus.syncedCounts && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+            <div className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-700">
+              <span className="text-slate-500 dark:text-slate-400 block">Customers</span>
+              <strong className="text-slate-900 dark:text-slate-100">
+                {firestoreSyncStatus.syncedCounts.customers}
+              </strong>
+            </div>
+            <div className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-700">
+              <span className="text-slate-500 dark:text-slate-400 block">Suppliers</span>
+              <strong className="text-slate-900 dark:text-slate-100">
+                {firestoreSyncStatus.syncedCounts.suppliers}
+              </strong>
+            </div>
+            <div className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-700">
+              <span className="text-slate-500 dark:text-slate-400 block">Sales Bills</span>
+              <strong className="text-slate-900 dark:text-slate-100">
+                {firestoreSyncStatus.syncedCounts.sales}
+              </strong>
+            </div>
+            <div className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-700">
+              <span className="text-slate-500 dark:text-slate-400 block">Products</span>
+              <strong className="text-slate-900 dark:text-slate-100">
+                {firestoreSyncStatus.syncedCounts.products}
+              </strong>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Prominent PDF & Excel Business Exports */}

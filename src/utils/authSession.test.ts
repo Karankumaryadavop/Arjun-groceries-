@@ -331,3 +331,105 @@ test('Role-scoped CUSTOMER and SUPPLIER sessions persist cleanly even when store
   assert.equal(verifiedSup.session?.portalEntityId, 'sup-1');
 });
 
+test('FIREBASE_EMAIL owner sessions persist cleanly, require firebaseUid, and reject tampering', async () => {
+  const now = 1_760_000_000_000;
+
+  await assert.rejects(
+    () =>
+      createSignedAuthSession({
+        authMode: 'FIREBASE_EMAIL',
+        email: 'owner@example.com',
+        nowMs: now,
+      }),
+    /verified Firebase user ID/i
+  );
+
+  const { record, key } = await createSignedAuthSession({
+    authMode: 'FIREBASE_EMAIL',
+    email: ' Owner@Example.COM ',
+    firebaseUid: 'uid-test-12345',
+    ttlMs: 24 * 60 * 60 * 1000,
+    nowMs: now,
+  });
+
+  const verified = await verifyPersistedAuthSession({
+    record,
+    key,
+    pinRecord: null,
+    isPinEnabled: false,
+    nowMs: now + 60_000,
+  });
+  assert.equal(verified.status, 'VALID');
+  assert.equal(verified.session?.authMode, 'FIREBASE_EMAIL');
+  assert.equal(verified.session?.email, 'owner@example.com');
+  assert.equal(verified.session?.firebaseUid, 'uid-test-12345');
+
+  const tampered = {
+    ...record,
+    payload: {
+      ...record.payload,
+      firebaseUid: 'uid-attacker-999',
+    },
+  };
+  const tamperedRes = await verifyPersistedAuthSession({
+    record: tampered,
+    key,
+    pinRecord: null,
+    isPinEnabled: false,
+    nowMs: now + 60_000,
+  });
+  assert.equal(tamperedRes.status, 'INVALID');
+});
+
+test('FIREBASE_GOOGLE owner sessions persist cleanly, require firebaseUid, and reject tampering', async () => {
+  const now = 1_760_000_000_000;
+
+  await assert.rejects(
+    () =>
+      createSignedAuthSession({
+        authMode: 'FIREBASE_GOOGLE',
+        email: 'owner@gmail.com',
+        nowMs: now,
+      }),
+    /verified Firebase user ID/i
+  );
+
+  const { record, key } = await createSignedAuthSession({
+    authMode: 'FIREBASE_GOOGLE',
+    email: 'Owner@Gmail.COM',
+    firebaseUid: 'google-uid-67890',
+    ttlMs: 24 * 60 * 60 * 1000,
+    nowMs: now,
+  });
+
+  const verified = await verifyPersistedAuthSession({
+    record,
+    key,
+    pinRecord: null,
+    isPinEnabled: false,
+    nowMs: now + 60_000,
+  });
+  assert.equal(verified.status, 'VALID');
+  assert.equal(verified.session?.authMode, 'FIREBASE_GOOGLE');
+  assert.equal(verified.session?.email, 'owner@gmail.com');
+  assert.equal(verified.session?.firebaseUid, 'google-uid-67890');
+
+  const tampered = {
+    ...record,
+    payload: {
+      ...record.payload,
+      email: 'attacker@gmail.com',
+    },
+  };
+  const tamperedRes = await verifyPersistedAuthSession({
+    record: tampered,
+    key,
+    pinRecord: null,
+    isPinEnabled: false,
+    nowMs: now + 60_000,
+  });
+  assert.equal(tamperedRes.status, 'INVALID');
+});
+
+
+

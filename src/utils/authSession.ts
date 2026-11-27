@@ -16,12 +16,20 @@ export const AUTH_SESSION_KEY_META_KEY = 'authSessionKey';
 export const DEFAULT_AUTH_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_CLOCK_SKEW_MS = 60 * 1000; // 1 minute
 
-export type StoreAuthMode = 'PIN' | 'GUEST' | 'CUSTOMER' | 'SUPPLIER';
+export type StoreAuthMode =
+  | 'FIREBASE_EMAIL'
+  | 'FIREBASE_GOOGLE'
+  | 'PIN'
+  | 'GUEST'
+  | 'CUSTOMER'
+  | 'SUPPLIER';
 
 export interface AuthSessionPayload {
   version: 1;
   sessionId: string;
   authMode: StoreAuthMode;
+  email?: string;
+  firebaseUid?: string;
   mobile?: string;
   portalEntityId?: string;
   portalEntityName?: string;
@@ -166,6 +174,8 @@ export async function generateSessionSigningKey(): Promise<CryptoKey> {
  */
 export async function createSignedAuthSession(params: {
   authMode: StoreAuthMode;
+  email?: string;
+  firebaseUid?: string;
   mobile?: string;
   portalEntityId?: string;
   portalEntityName?: string;
@@ -186,12 +196,21 @@ export async function createSignedAuthSession(params: {
   }
 
   if (
+    (params.authMode === 'FIREBASE_EMAIL' || params.authMode === 'FIREBASE_GOOGLE') &&
+    (!params.firebaseUid || !params.firebaseUid.trim())
+  ) {
+    throw new Error('Cannot create Firebase auth session without a verified Firebase user ID.');
+  }
+
+  if (
     (params.authMode === 'CUSTOMER' || params.authMode === 'SUPPLIER') &&
     (!params.portalEntityId || !params.portalEntityId.trim())
   ) {
     throw new Error(`Cannot create ${params.authMode} portal session without a verified entity ID.`);
   }
 
+  const normalizedEmail = params.email?.trim().toLowerCase();
+  const cleanFirebaseUid = params.firebaseUid?.trim();
   const normalizedMobile = params.mobile ? normalizeMobileDigits(params.mobile) : undefined;
   const cleanEntityId = params.portalEntityId?.trim();
   const cleanEntityName = params.portalEntityName?.trim();
@@ -199,6 +218,8 @@ export async function createSignedAuthSession(params: {
     version: 1,
     sessionId: generateSessionId(),
     authMode: params.authMode,
+    ...(normalizedEmail ? { email: normalizedEmail } : {}),
+    ...(cleanFirebaseUid ? { firebaseUid: cleanFirebaseUid } : {}),
     ...(normalizedMobile && normalizedMobile.length >= 10 ? { mobile: normalizedMobile } : {}),
     ...(cleanEntityId ? { portalEntityId: cleanEntityId } : {}),
     ...(cleanEntityName ? { portalEntityName: cleanEntityName } : {}),
@@ -224,6 +245,8 @@ function isValidPayloadShape(raw: unknown): raw is AuthSessionPayload {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
   const p = raw as Partial<AuthSessionPayload>;
   const validMode =
+    p.authMode === 'FIREBASE_EMAIL' ||
+    p.authMode === 'FIREBASE_GOOGLE' ||
     p.authMode === 'PIN' ||
     p.authMode === 'GUEST' ||
     p.authMode === 'CUSTOMER' ||
@@ -232,12 +255,17 @@ function isValidPayloadShape(raw: unknown): raw is AuthSessionPayload {
     p.authMode === 'CUSTOMER' || p.authMode === 'SUPPLIER'
       ? typeof p.portalEntityId === 'string' && p.portalEntityId.trim().length > 0
       : true;
+  const validFirebaseUid =
+    p.authMode === 'FIREBASE_EMAIL' || p.authMode === 'FIREBASE_GOOGLE'
+      ? typeof p.firebaseUid === 'string' && p.firebaseUid.trim().length > 0
+      : true;
   return (
     p.version === 1 &&
     typeof p.sessionId === 'string' &&
     p.sessionId.length >= 16 &&
     validMode &&
     validPortalId &&
+    validFirebaseUid &&
     typeof p.issuedAt === 'number' &&
     Number.isFinite(p.issuedAt) &&
     typeof p.expiresAt === 'number' &&

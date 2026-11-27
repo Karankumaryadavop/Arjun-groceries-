@@ -5,22 +5,16 @@ import {
   Eye,
   EyeOff,
   AlertCircle,
-  Clock,
   CheckCircle2,
   ArrowLeft,
-  Store,
   Phone,
   Users,
   Truck,
-  KeyRound,
-  ShieldCheck,
   UserPlus,
   Mail,
   X,
 } from 'lucide-react';
 import { useStore } from '../context/StoreContext';
-import { getPinCooldownRemainingSeconds } from '../utils/securityCrypto';
-import { validateLoginCredentialsInput } from '../utils/loginValidation';
 import { BRAND_NAME } from './BrandLogo';
 import { RegisterStoreView } from './RegisterStoreView';
 
@@ -30,24 +24,16 @@ interface LoginScreenProps {
 
 type AuthScreenMode =
   | 'OWNER_LOGIN'
-  | 'FORGOT_PASSWORD'
   | 'CREATE_ACCOUNT'
   | 'CUSTOMER_LOGIN'
   | 'SUPPLIER_LOGIN';
 
-type RecoveryMethod = 'STORE_DETAILS' | 'GOOGLE';
-
 export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
   const {
     profile,
-    updateProfile,
-    hasPinConfigured,
-    unlockWithPin,
-    updatePinSecurity,
-    completeStoreLogin,
+    signInWithEmailPassword,
+    signInWithGoogle,
     requestPasswordResetEmail,
-    recoverOwnerWithStoreDetails,
-    recoverOwnerWithGoogle,
     loginAsCustomer,
     loginAsSupplier,
     authNotice,
@@ -56,12 +42,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
 
   const [mode, setMode] = useState<AuthScreenMode>('OWNER_LOGIN');
 
-  // Owner Login state
-  const [mobile, setMobile] = useState('');
-  const [pin, setPin] = useState('');
-  const [showPin, setShowPin] = useState(false);
-  const [showForgotOption, setShowForgotOption] = useState(false);
-  const [lastValidMobile, setLastValidMobile] = useState('');
+  // Firebase Email & Password Sign-In state
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [providerDisabled, setProviderDisabled] = useState(false);
 
   // Forgot Password Email Overlay state (Firebase sendPasswordResetEmail)
   const [isForgotOverlayOpen, setIsForgotOverlayOpen] = useState(false);
@@ -72,15 +57,6 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
   const [resetProviderDisabled, setResetProviderDisabled] = useState(false);
   const [resetSentBanner, setResetSentBanner] = useState<string | null>(null);
 
-  // Offline Forgot Password / Alternate PIN Recovery state
-  const [recoveryMethod, setRecoveryMethod] = useState<RecoveryMethod>('STORE_DETAILS');
-  const [recoveryMobile, setRecoveryMobile] = useState('');
-  const [recoveryOwnerName, setRecoveryOwnerName] = useState('');
-  const [recoveryStoreName, setRecoveryStoreName] = useState('');
-  const [recoveryNewPin, setRecoveryNewPin] = useState('');
-  const [recoveryConfirmPin, setRecoveryConfirmPin] = useState('');
-  const [showRecoveryPin, setShowRecoveryPin] = useState(false);
-
   // Customer / Supplier Portal Login state
   const [portalName, setPortalName] = useState('');
   const [portalPhone, setPortalPhone] = useState('');
@@ -88,19 +64,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
   // Shared feedback state
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [cooldownSec, setCooldownSec] = useState<number>(() => getPinCooldownRemainingSeconds());
-
-  useEffect(() => {
-    if (cooldownSec <= 0) return;
-    const timer = setInterval(() => {
-      const rem = getPinCooldownRemainingSeconds();
-      setCooldownSec(rem);
-      if (rem <= 0) {
-        setErrorMsg(null);
-      }
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [cooldownSec]);
+  const [isGoogleSubmitting, setIsGoogleSubmitting] = useState(false);
 
   useEffect(() => {
     if (!isForgotOverlayOpen) return;
@@ -114,7 +78,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
   }, [isForgotOverlayOpen]);
 
   const openForgotOverlay = () => {
-    setResetIdentifier(lastValidMobile || mobile || '');
+    setResetIdentifier(email.trim());
     setResetError(null);
     setResetSuccessMsg(null);
     setResetProviderDisabled(false);
@@ -124,12 +88,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
   const switchMode = (nextMode: AuthScreenMode) => {
     setMode(nextMode);
     setErrorMsg(null);
+    setProviderDisabled(false);
     clearAuthNotice();
-    if (nextMode === 'FORGOT_PASSWORD') {
-      setRecoveryMobile(lastValidMobile || mobile);
-      setRecoveryNewPin('');
-      setRecoveryConfirmPin('');
-    }
     if (nextMode === 'CUSTOMER_LOGIN' || nextMode === 'SUPPLIER_LOGIN') {
       setPortalName('');
       setPortalPhone('');
@@ -162,70 +122,16 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (cooldownSec > 0) {
-      setErrorMsg(`Too many incorrect attempts. Try again in ${cooldownSec}s.`);
-      setShowForgotOption(true);
-      return;
-    }
-
-    const check = validateLoginCredentialsInput({
-      mobile,
-      pin,
-      registeredPhone: profile.phone,
-    });
-    if (!check.valid || !check.normalizedMobile || !check.normalizedPin) {
-      setErrorMsg(check.error || 'Please check your mobile number and 4-digit PIN.');
-      return;
-    }
-
     setIsSubmitting(true);
     setErrorMsg(null);
+    setProviderDisabled(false);
     clearAuthNotice();
-    try {
-      if (hasPinConfigured) {
-        const unlocked = await unlockWithPin(check.normalizedPin);
-        if (!unlocked) {
-          const remaining = getPinCooldownRemainingSeconds();
-          setCooldownSec(remaining);
-          setLastValidMobile(check.normalizedMobile);
-          setShowForgotOption(true);
-          setErrorMsg(
-            remaining > 0
-              ? `Too many incorrect attempts. Try again in ${remaining}s, or use Forgot password below.`
-              : 'Incorrect PIN for this mobile number. Please try again or reset your password.'
-          );
-          return;
-        }
-        setShowForgotOption(false);
-        if (!profile.phone || profile.phone.replace(/\D/g, '').length < 10) {
-          updateProfile({ phone: check.normalizedMobile });
-        }
-        const sessionRes = await completeStoreLogin({
-          authMode: 'PIN',
-          mobile: check.normalizedMobile,
-        });
-        if (!sessionRes.success) {
-          setErrorMsg(sessionRes.error || 'Could not start your store session. Please try again.');
-          return;
-        }
-        onSuccess?.();
-        return;
-      }
 
-      const setupRes = await updatePinSecurity(check.normalizedPin);
-      if (!setupRes.success) {
-        setErrorMsg(setupRes.error || 'Could not configure your store PIN.');
-        return;
-      }
-      if (!profile.phone || profile.phone.replace(/\D/g, '').length < 10) {
-        updateProfile({ phone: check.normalizedMobile });
-      }
-      const sessionRes = await completeStoreLogin({
-        authMode: 'PIN',
-        mobile: check.normalizedMobile,
-      });
-      if (!sessionRes.success) {
-        setErrorMsg(sessionRes.error || 'Could not start your store session. Please try again.');
+    try {
+      const res = await signInWithEmailPassword({ email, password });
+      if (!res.success) {
+        setErrorMsg(res.error || 'Invalid email or password. Please try again.');
+        setProviderDisabled(Boolean(res.providerDisabled));
         return;
       }
       onSuccess?.();
@@ -234,42 +140,22 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
     }
   };
 
-  const handleRecoverySubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsSubmitting(true);
+  const handleGoogleSignIn = async () => {
+    setIsGoogleSubmitting(true);
     setErrorMsg(null);
+    setProviderDisabled(false);
     clearAuthNotice();
+
     try {
-      if (recoveryMethod === 'STORE_DETAILS') {
-        const res = await recoverOwnerWithStoreDetails({
-          mobile: recoveryMobile,
-          ownerName: recoveryOwnerName,
-          storeName: recoveryStoreName,
-          newPin: recoveryNewPin,
-          confirmNewPin: recoveryConfirmPin,
-        });
-        if (!res.success) {
-          setErrorMsg(res.error || 'Verification failed. Please check your registered details.');
-          return;
-        }
-        setCooldownSec(0);
-        setShowForgotOption(false);
-        onSuccess?.();
-      } else {
-        const res = await recoverOwnerWithGoogle({
-          newPin: recoveryNewPin,
-          confirmNewPin: recoveryConfirmPin,
-        });
-        if (!res.success) {
-          setErrorMsg(res.error || 'Google verification failed. Please try again.');
-          return;
-        }
-        setCooldownSec(0);
-        setShowForgotOption(false);
-        onSuccess?.();
+      const res = await signInWithGoogle();
+      if (!res.success) {
+        setErrorMsg(res.error || 'Could not sign in with Google. Please try again.');
+        setProviderDisabled(Boolean(res.providerDisabled));
+        return;
       }
+      onSuccess?.();
     } finally {
-      setIsSubmitting(false);
+      setIsGoogleSubmitting(false);
     }
   };
 
@@ -294,7 +180,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
     }
   };
 
-  // Dedicated Register / Create Account View (connects to Firebase Auth & initializes Firestore store doc)
+  // Dedicated Sign Up View (Firebase Email & Password)
   if (mode === 'CREATE_ACCOUNT') {
     return (
       <RegisterStoreView
@@ -312,11 +198,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
   const headingCopy: Record<Exclude<AuthScreenMode, 'CREATE_ACCOUNT'>, { title: string; subtitle: string }> = {
     OWNER_LOGIN: {
       title: 'Welcome Back!',
-      subtitle: 'Login to continue',
-    },
-    FORGOT_PASSWORD: {
-      title: 'Login Another Way',
-      subtitle: 'Verify your identity to reset your 4-digit PIN',
+      subtitle: 'Sign in with your email or Google account',
     },
     CUSTOMER_LOGIN: {
       title: 'Customer Login',
@@ -335,7 +217,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
       <section
         aria-label={`${displayName} ${headingCopy[mode].title}`}
         data-login-mode={mode}
-        className="relative w-full min-h-[100dvh] sm:min-h-[760px] sm:max-w-[432px] sm:rounded-[28px] sm:shadow-2xl sm:border sm:border-emerald-900/15 dark:sm:border-emerald-500/20 bg-white dark:bg-slate-900 overflow-hidden flex flex-col justify-between px-6 pt-8 pb-7"
+        className="relative w-full min-h-[100dvh] sm:min-h-[740px] sm:max-w-[432px] sm:rounded-[28px] sm:shadow-2xl sm:border sm:border-emerald-900/15 dark:sm:border-emerald-500/20 bg-white dark:bg-slate-900 overflow-hidden flex flex-col justify-between px-6 pt-8 pb-7"
       >
         {/* Botanical Leaf & Wave Background Accents */}
         <div className="pointer-events-none select-none" aria-hidden="true">
@@ -368,7 +250,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
               className="inline-flex items-center gap-1.5 text-sm font-semibold text-[#11641c] dark:text-emerald-300 hover:text-[#0d4d18] dark:hover:text-emerald-200 min-h-[44px] pr-3 cursor-pointer"
             >
               <ArrowLeft className="w-4 h-4" />
-              <span>Back to Login</span>
+              <span>Back to Sign In</span>
             </button>
           </div>
         )}
@@ -443,7 +325,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
         {/* Center Interactive Area */}
         <div className="relative z-10 w-full my-5">
           {/* Shared Auth Notice (Owner Login only) */}
-          {mode === 'OWNER_LOGIN' && authNotice && !errorMsg && cooldownSec <= 0 && (
+          {mode === 'OWNER_LOGIN' && authNotice && !errorMsg && (
             <div
               role={authNotice.type === 'logged_out' ? 'status' : 'alert'}
               data-testid="auth-notice-banner"
@@ -455,9 +337,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
                     : 'bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
               }`}
             >
-              {authNotice.type === 'expired' ? (
-                <Clock className="w-4 h-4 shrink-0 mt-0.5" />
-              ) : authNotice.type === 'logged_out' ? (
+              {authNotice.type === 'logged_out' ? (
                 <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
               ) : (
                 <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -466,7 +346,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
             </div>
           )}
 
-          {/* Post-Reset Confirmation Banner (persists cleanly after dismissing Forgot Password modal) */}
+          {/* Post-Reset Confirmation Banner */}
           {mode === 'OWNER_LOGIN' && resetSentBanner && !errorMsg && (
             <div
               role="status"
@@ -489,144 +369,140 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
             </div>
           )}
 
-          {/* Shared Error / Cooldown Banner */}
-          {(errorMsg || (mode === 'OWNER_LOGIN' && cooldownSec > 0)) && (
+          {/* Shared Error Banner */}
+          {errorMsg && (
             <div
               role="alert"
               data-testid="login-error-banner"
-              className={`mb-3.5 flex items-start gap-2 px-3.5 py-2.5 rounded-2xl text-xs font-semibold ${
-                mode === 'OWNER_LOGIN' && cooldownSec > 0
-                  ? 'bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 text-amber-900 dark:text-amber-200'
-                  : 'bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
-              }`}
+              className="mb-3.5 flex items-start gap-2 px-3.5 py-2.5 rounded-2xl text-xs font-semibold bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
             >
-              {mode === 'OWNER_LOGIN' && cooldownSec > 0 ? (
-                <Clock className="w-4 h-4 shrink-0 mt-0.5" />
-              ) : (
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-              )}
-              <span>
-                {mode === 'OWNER_LOGIN' && cooldownSec > 0
-                  ? `Too many incorrect attempts. Please wait ${cooldownSec}s, or use Forgot password below.`
-                  : errorMsg}
-              </span>
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p>{errorMsg}</p>
+                {providerDisabled && (
+                  <p className="text-[11px] font-normal text-red-600 dark:text-red-300">
+                    Firebase Console → Authentication → Sign-in method → Enable Email/Password &amp; Google.
+                  </p>
+                )}
+              </div>
             </div>
           )}
 
-          {/* ===================== 1. OWNER LOGIN ===================== */}
+          {/* ===================== 1. FIREBASE EMAIL & PASSWORD SIGN IN ===================== */}
           {mode === 'OWNER_LOGIN' && (
-            <form onSubmit={handleLoginSubmit} className="space-y-3">
-              {/* Mobile Number Field */}
+            <form onSubmit={handleLoginSubmit} className="space-y-3" noValidate>
+              {/* Email Address Field */}
               <div className="flex items-center gap-3 bg-[#f1f3f5] dark:bg-slate-800 border border-slate-200/90 dark:border-slate-700 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/20 rounded-2xl px-4 min-h-[52px] transition-all">
-                <User
+                <Mail
                   className="w-5 h-5 text-[#115e22] dark:text-emerald-400 shrink-0"
                   aria-hidden="true"
                 />
                 <input
-                  type="tel"
-                  inputMode="tel"
-                  autoComplete="tel"
-                  aria-label="Enter Mobile Number"
-                  placeholder="Enter Mobile Number"
-                  value={mobile}
+                  type="email"
+                  autoComplete="email"
+                  aria-label="Email Address"
+                  placeholder="Enter Email Address"
+                  value={email}
                   onChange={(e) => {
-                    setMobile(e.target.value);
+                    setEmail(e.target.value);
                     if (errorMsg) setErrorMsg(null);
                   }}
                   className="w-full bg-transparent text-sm sm:text-base font-medium text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none py-3"
                 />
               </div>
 
-              {/* PIN Field with Visibility Toggle */}
+              {/* Password Field with Visibility Toggle */}
               <div className="flex items-center gap-3 bg-[#f1f3f5] dark:bg-slate-800 border border-slate-200/90 dark:border-slate-700 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/20 rounded-2xl pl-4 pr-2 min-h-[52px] transition-all">
                 <Lock
                   className="w-5 h-5 text-[#115e22] dark:text-emerald-400 shrink-0"
                   aria-hidden="true"
                 />
                 <input
-                  type={showPin ? 'text' : 'password'}
-                  inputMode="numeric"
+                  type={showPassword ? 'text' : 'password'}
                   autoComplete="current-password"
-                  maxLength={4}
-                  aria-label="Enter PIN"
-                  placeholder="Enter PIN"
-                  value={pin}
+                  aria-label="Password"
+                  placeholder="Enter Password"
+                  value={password}
                   onChange={(e) => {
-                    setPin(e.target.value.replace(/\D/g, '').slice(0, 4));
+                    setPassword(e.target.value);
                     if (errorMsg) setErrorMsg(null);
                   }}
-                  className="w-full bg-transparent text-sm sm:text-base font-medium text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none py-3 tracking-wider"
+                  className="w-full bg-transparent text-sm sm:text-base font-medium text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none py-3"
                 />
                 <button
                   type="button"
                   data-testid="login-password-visibility-toggle"
-                  onClick={() => setShowPin((v) => !v)}
-                  aria-label={showPin ? 'Hide PIN' : 'Show PIN'}
-                  aria-pressed={showPin}
+                  onClick={() => setShowPassword((v) => !v)}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  aria-pressed={showPassword}
                   className="p-2 rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-200/70 dark:hover:bg-slate-700 transition-colors cursor-pointer min-w-[44px] min-h-[44px] flex items-center justify-center shrink-0"
                 >
-                  {showPin ? <Eye className="w-5 h-5" /> : <EyeOff className="w-5 h-5" />}
+                  {showPassword ? <Eye className="w-5 h-5" /> : <EyeOff className="w-5 h-5" />}
                 </button>
               </div>
 
-              {/* Forgot Password Link (always accessible; elevated banner after wrong PIN) */}
-              {showForgotOption ? (
-                <div className="rounded-2xl bg-emerald-50/90 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 p-3 space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 text-xs text-emerald-950 dark:text-emerald-100">
-                      <KeyRound className="w-4 h-4 text-[#0d7f1f] dark:text-emerald-400 shrink-0" />
-                      <span className="font-semibold">Forgot your password?</span>
-                    </div>
-                    <button
-                      type="button"
-                      data-testid="forgot-password-btn"
-                      onClick={openForgotOverlay}
-                      className="text-xs font-bold text-[#0d7f1f] dark:text-emerald-300 underline underline-offset-2 hover:text-[#085c15] dark:hover:text-emerald-200 min-h-[36px] px-2 cursor-pointer shrink-0"
-                    >
-                      Send Reset Email
-                    </button>
-                  </div>
-                  <button
-                    type="button"
-                    data-testid="offline-pin-recovery-btn"
-                    onClick={() => switchMode('FORGOT_PASSWORD')}
-                    className="text-xs font-medium text-slate-600 dark:text-slate-300 hover:text-[#0d4d18] dark:hover:text-emerald-300 underline underline-offset-2 cursor-pointer"
-                  >
-                    Or login another way (offline store details / Google)
-                  </button>
-                </div>
-              ) : (
-                <div className="flex justify-end px-1 -mt-1">
-                  <button
-                    type="button"
-                    data-testid="forgot-password-btn"
-                    onClick={openForgotOverlay}
-                    className="text-xs font-semibold text-[#11641c] dark:text-emerald-400 hover:text-[#0b4914] dark:hover:text-emerald-300 hover:underline min-h-[44px] px-1 cursor-pointer"
-                  >
-                    Forgot password?
-                  </button>
-                </div>
-              )}
+              {/* Forgot Password Link */}
+              <div className="flex justify-end px-1 -mt-1">
+                <button
+                  type="button"
+                  data-testid="forgot-password-btn"
+                  onClick={openForgotOverlay}
+                  className="text-xs font-semibold text-[#11641c] dark:text-emerald-400 hover:text-[#0b4914] dark:hover:text-emerald-300 hover:underline min-h-[40px] px-1 cursor-pointer"
+                >
+                  Forgot password?
+                </button>
+              </div>
 
-              {/* Primary Login Button */}
+              {/* Primary Sign In Button */}
               <button
                 type="submit"
-                disabled={isSubmitting || cooldownSec > 0}
+                disabled={isSubmitting || isGoogleSubmitting}
+                data-testid="email-signin-submit-btn"
                 className="w-full min-h-[48px] py-3 px-6 rounded-full bg-[#0d7f1f] hover:bg-[#086917] active:bg-[#065412] disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold text-base shadow-md shadow-emerald-900/15 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-offset-2"
               >
-                {isSubmitting ? 'Verifying...' : 'Login'}
+                {isSubmitting ? 'Signing In...' : 'Sign In'}
               </button>
 
-              {/* Register / Create an Account link */}
+              {/* Google Sign-In Button */}
+              <button
+                type="button"
+                disabled={isSubmitting || isGoogleSubmitting}
+                data-testid="google-signin-btn"
+                onClick={handleGoogleSignIn}
+                className="w-full min-h-[48px] py-2.5 px-5 rounded-full bg-white hover:bg-slate-50 active:bg-slate-100 disabled:opacity-60 disabled:cursor-not-allowed dark:bg-slate-800 dark:hover:bg-slate-700/80 border border-slate-300 dark:border-slate-600 text-slate-800 dark:text-slate-100 font-semibold text-sm sm:text-base shadow-xs flex items-center justify-center gap-2.5 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-offset-2"
+              >
+                <svg className="w-5 h-5 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    fill="#4285F4"
+                    d="M23.49 12.27c0-.79-.07-1.54-.2-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09C3.26 21.3 7.31 24 12 24z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M5.27 14.29c-.25-.72-.38-1.49-.38-2.29s.14-1.57.38-2.29V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.98-3.09z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z"
+                  />
+                </svg>
+                <span>{isGoogleSubmitting ? 'Signing in with Google...' : 'Continue with Google'}</span>
+              </button>
+
+              {/* Sign Up / Create Account link */}
               <div className="flex items-center justify-center pt-0.5">
                 <button
                   type="button"
+                  disabled={isSubmitting || isGoogleSubmitting}
                   data-testid="create-account-btn"
                   onClick={() => switchMode('CREATE_ACCOUNT')}
                   className="inline-flex items-center gap-1.5 text-sm font-semibold text-[#11641c] dark:text-emerald-300 hover:text-[#0b4914] dark:hover:text-emerald-200 min-h-[40px] px-3 cursor-pointer"
                 >
                   <UserPlus className="w-4 h-4" />
-                  <span>Register / Create an Account</span>
+                  <span>Don&apos;t have an account? Sign Up</span>
                 </button>
               </div>
 
@@ -643,7 +519,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
               <div className="grid grid-cols-2 gap-2.5">
                 <button
                   type="button"
-                  disabled={isSubmitting}
+                  disabled={isSubmitting || isGoogleSubmitting}
                   data-testid="continue-customer-btn"
                   onClick={() => switchMode('CUSTOMER_LOGIN')}
                   className="w-full min-h-[48px] py-2.5 px-3 rounded-full bg-[#effaed] hover:bg-[#e1f5dd] active:bg-[#d2f0cc] disabled:opacity-60 dark:bg-emerald-950/50 dark:hover:bg-emerald-900/50 border border-[#2f8b39] dark:border-emerald-700 text-[#11641c] dark:text-emerald-300 font-semibold text-sm flex items-center justify-center gap-1.5 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-offset-2"
@@ -654,7 +530,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
 
                 <button
                   type="button"
-                  disabled={isSubmitting}
+                  disabled={isSubmitting || isGoogleSubmitting}
                   data-testid="continue-supplier-btn"
                   onClick={() => switchMode('SUPPLIER_LOGIN')}
                   className="w-full min-h-[48px] py-2.5 px-3 rounded-full bg-[#effaed] hover:bg-[#e1f5dd] active:bg-[#d2f0cc] disabled:opacity-60 dark:bg-emerald-950/50 dark:hover:bg-emerald-900/50 border border-[#2f8b39] dark:border-emerald-700 text-[#11641c] dark:text-emerald-300 font-semibold text-sm flex items-center justify-center gap-1.5 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-offset-2"
@@ -666,166 +542,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
             </form>
           )}
 
-          {/* ===================== 2. OFFLINE / GOOGLE PIN RECOVERY ===================== */}
-          {mode === 'FORGOT_PASSWORD' && (
-            <form onSubmit={handleRecoverySubmit} className="space-y-3">
-              <div
-                role="tablist"
-                aria-label="Alternate login method"
-                className="grid grid-cols-2 p-1 rounded-2xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700"
-              >
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={recoveryMethod === 'STORE_DETAILS'}
-                  onClick={() => {
-                    setRecoveryMethod('STORE_DETAILS');
-                    setErrorMsg(null);
-                  }}
-                  className={`min-h-[40px] rounded-xl text-xs font-bold transition-colors cursor-pointer ${
-                    recoveryMethod === 'STORE_DETAILS'
-                      ? 'bg-white dark:bg-slate-900 text-[#0d4d18] dark:text-emerald-300 shadow-xs'
-                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                  }`}
-                >
-                  Store Details
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={recoveryMethod === 'GOOGLE'}
-                  onClick={() => {
-                    setRecoveryMethod('GOOGLE');
-                    setErrorMsg(null);
-                  }}
-                  className={`min-h-[40px] rounded-xl text-xs font-bold transition-colors cursor-pointer ${
-                    recoveryMethod === 'GOOGLE'
-                      ? 'bg-white dark:bg-slate-900 text-[#0d4d18] dark:text-emerald-300 shadow-xs'
-                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                  }`}
-                >
-                  Google Account
-                </button>
-              </div>
-
-              {recoveryMethod === 'STORE_DETAILS' ? (
-                <>
-                  <div className="flex items-center gap-3 bg-[#f1f3f5] dark:bg-slate-800 border border-slate-200/90 dark:border-slate-700 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/20 rounded-2xl px-4 min-h-[48px]">
-                    <Phone className="w-4 h-4 text-[#115e22] dark:text-emerald-400 shrink-0" />
-                    <input
-                      type="tel"
-                      inputMode="tel"
-                      aria-label="Registered Mobile Number"
-                      placeholder="Registered Mobile Number"
-                      value={recoveryMobile}
-                      onChange={(e) => {
-                        setRecoveryMobile(e.target.value);
-                        if (errorMsg) setErrorMsg(null);
-                      }}
-                      className="w-full bg-transparent text-sm font-medium text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none py-2.5"
-                    />
-                  </div>
-
-                  <div className="flex items-center gap-3 bg-[#f1f3f5] dark:bg-slate-800 border border-slate-200/90 dark:border-slate-700 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/20 rounded-2xl px-4 min-h-[48px]">
-                    <User className="w-4 h-4 text-[#115e22] dark:text-emerald-400 shrink-0" />
-                    <input
-                      type="text"
-                      aria-label="Registered Owner Name"
-                      placeholder="Registered Owner Name"
-                      value={recoveryOwnerName}
-                      onChange={(e) => {
-                        setRecoveryOwnerName(e.target.value);
-                        if (errorMsg) setErrorMsg(null);
-                      }}
-                      className="w-full bg-transparent text-sm font-medium text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none py-2.5"
-                    />
-                  </div>
-
-                  <div className="flex items-center gap-3 bg-[#f1f3f5] dark:bg-slate-800 border border-slate-200/90 dark:border-slate-700 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/20 rounded-2xl px-4 min-h-[48px]">
-                    <Store className="w-4 h-4 text-[#115e22] dark:text-emerald-400 shrink-0" />
-                    <input
-                      type="text"
-                      aria-label="Registered Store Name"
-                      placeholder="Registered Store Name"
-                      value={recoveryStoreName}
-                      onChange={(e) => {
-                        setRecoveryStoreName(e.target.value);
-                        if (errorMsg) setErrorMsg(null);
-                      }}
-                      className="w-full bg-transparent text-sm font-medium text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none py-2.5"
-                    />
-                  </div>
-                </>
-              ) : (
-                <div className="rounded-2xl bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 p-3.5 text-xs text-slate-700 dark:text-slate-300 leading-relaxed flex items-start gap-2.5">
-                  <ShieldCheck className="w-4 h-4 text-[#0d7f1f] dark:text-emerald-400 shrink-0 mt-0.5" />
-                  <span>
-                    Sign in with your Google account to verify ownership, set a fresh 4-digit store
-                    PIN, and unlock your dashboard immediately.
-                  </span>
-                </div>
-              )}
-
-              <div className="grid grid-cols-2 gap-2.5">
-                <div className="flex items-center gap-2 bg-[#f1f3f5] dark:bg-slate-800 border border-slate-200/90 dark:border-slate-700 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/20 rounded-2xl px-3.5 min-h-[48px]">
-                  <Lock className="w-4 h-4 text-[#115e22] dark:text-emerald-400 shrink-0" />
-                  <input
-                    type={showRecoveryPin ? 'text' : 'password'}
-                    inputMode="numeric"
-                    maxLength={4}
-                    aria-label="New 4-Digit PIN"
-                    placeholder="New PIN"
-                    value={recoveryNewPin}
-                    onChange={(e) => {
-                      setRecoveryNewPin(e.target.value.replace(/\D/g, '').slice(0, 4));
-                      if (errorMsg) setErrorMsg(null);
-                    }}
-                    className="w-full bg-transparent text-sm font-medium text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none py-2.5 tracking-wider"
-                  />
-                </div>
-                <div className="flex items-center gap-2 bg-[#f1f3f5] dark:bg-slate-800 border border-slate-200/90 dark:border-slate-700 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/20 rounded-2xl pl-3.5 pr-1.5 min-h-[48px]">
-                  <input
-                    type={showRecoveryPin ? 'text' : 'password'}
-                    inputMode="numeric"
-                    maxLength={4}
-                    aria-label="Confirm New PIN"
-                    placeholder="Confirm PIN"
-                    value={recoveryConfirmPin}
-                    onChange={(e) => {
-                      setRecoveryConfirmPin(e.target.value.replace(/\D/g, '').slice(0, 4));
-                      if (errorMsg) setErrorMsg(null);
-                    }}
-                    className="w-full bg-transparent text-sm font-medium text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none py-2.5 tracking-wider"
-                  />
-                  <button
-                    type="button"
-                    data-testid="recovery-pin-visibility-toggle"
-                    onClick={() => setShowRecoveryPin((v) => !v)}
-                    aria-label={showRecoveryPin ? 'Hide new PIN' : 'Show new PIN'}
-                    aria-pressed={showRecoveryPin}
-                    className="p-1.5 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-200/70 dark:hover:bg-slate-700 cursor-pointer shrink-0"
-                  >
-                    {showRecoveryPin ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
-                  </button>
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                disabled={isSubmitting}
-                data-testid="recovery-submit-btn"
-                className="w-full min-h-[48px] py-3 px-6 rounded-full bg-[#0d7f1f] hover:bg-[#086917] active:bg-[#065412] disabled:opacity-60 text-white font-bold text-sm sm:text-base shadow-md shadow-emerald-900/15 transition-colors cursor-pointer"
-              >
-                {isSubmitting
-                  ? 'Verifying...'
-                  : recoveryMethod === 'STORE_DETAILS'
-                    ? 'Verify & Reset PIN'
-                    : 'Verify with Google & Login'}
-              </button>
-            </form>
-          )}
-
-          {/* ===================== 3 & 4. CUSTOMER / SUPPLIER LOGIN ===================== */}
+          {/* ===================== 2. CUSTOMER / SUPPLIER PORTAL LOGIN ===================== */}
           {(mode === 'CUSTOMER_LOGIN' || mode === 'SUPPLIER_LOGIN') && (
             <form onSubmit={handlePortalSubmit} className="space-y-3.5">
               <div className="flex items-center gap-3 bg-[#f1f3f5] dark:bg-slate-800 border border-slate-200/90 dark:border-slate-700 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/20 rounded-2xl px-4 min-h-[52px]">
@@ -935,7 +652,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
                     id="forgot-overlay-title"
                     className="text-base font-extrabold text-slate-900 dark:text-white"
                   >
-                    Forgot Password
+                    Reset Password
                   </h2>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
                     Send a password reset link to your email
@@ -953,8 +670,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
             </div>
 
             <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-              Enter your registered email address or 10-digit mobile number to receive a password
-              reset email.
+              Enter the email address associated with your account to receive a password reset link.
             </p>
 
             {resetError && (
@@ -986,14 +702,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
               </div>
             )}
 
-            <form onSubmit={handlePasswordResetSubmit} className="space-y-3">
+            <form onSubmit={handlePasswordResetSubmit} className="space-y-3" noValidate>
               <div className="flex items-center gap-3 bg-[#f1f3f5] dark:bg-slate-800 border border-slate-200/90 dark:border-slate-700 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/20 rounded-2xl px-4 min-h-[48px]">
                 <Mail className="w-4 h-4 text-[#115e22] dark:text-emerald-400 shrink-0" />
                 <input
-                  type="text"
+                  type="email"
                   autoFocus
-                  aria-label="Registered Mobile Number or Email"
-                  placeholder="Registered Mobile Number or Email"
+                  aria-label="Registered Email Address"
+                  placeholder="Enter your email address"
                   value={resetIdentifier}
                   onChange={(e) => {
                     setResetIdentifier(e.target.value);
@@ -1013,22 +729,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onSuccess }) => {
               </button>
             </form>
 
-            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2">
-              <button
-                type="button"
-                data-testid="switch-offline-pin-reset-btn"
-                onClick={() => {
-                  setIsForgotOverlayOpen(false);
-                  switchMode('FORGOT_PASSWORD');
-                }}
-                className="text-xs font-semibold text-[#11641c] dark:text-emerald-400 hover:underline min-h-[44px] cursor-pointer"
-              >
-                Reset 4-digit PIN offline instead
-              </button>
+            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex justify-end">
               <button
                 type="button"
                 onClick={() => setIsForgotOverlayOpen(false)}
-                className="text-xs font-semibold text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 min-h-[44px] px-2 cursor-pointer"
+                className="text-xs font-semibold text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 min-h-[40px] px-3 cursor-pointer"
               >
                 {resetSuccessMsg ? 'Done' : 'Cancel'}
               </button>

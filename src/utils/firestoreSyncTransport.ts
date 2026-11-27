@@ -13,25 +13,24 @@ import {
   setDoc,
   updateDoc,
   where,
+  writeBatch,
 } from 'firebase/firestore';
+import { db, FirestoreErrorInfo, handleFirestoreError, OperationType } from '../firebase';
 import {
   CashbookEntry,
   Customer,
   CustomerTransaction,
   ExpenseRecord,
-  LocalBackupSnapshot,
+  FirestoreSyncedCounts,
+  PaymentMethod,
   Product,
   SaleRecord,
   StoreBusinessDataset,
   StoreProfile,
   Supplier,
   SupplierTransaction,
-  SyncQueueItem,
 } from '../types';
-import { db, handleFirestoreError, OperationType } from '../firebase';
-import { CloudTransportAdapter, detectSyncConflict } from './cloudSyncEngine';
 import {
-  buildBackupManifestCloudPayload,
   buildCashbookCloudPayload,
   buildCustomerCloudPayload,
   buildCustomerTxCloudPayload,
@@ -42,814 +41,651 @@ import {
   buildSupplierCloudPayload,
   buildSupplierTxCloudPayload,
 } from './firestorePayload';
-import { computeDeterministicHash } from './localDatabase';
 
-function sanitizeId(raw: string): string {
-  return raw.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128) || 'id-0';
-}
+export type FirestoreCollectionKey =
+  | 'stores'
+  | 'customers'
+  | 'customerTransactions'
+  | 'suppliers'
+  | 'supplierTransactions'
+  | 'sales'
+  | 'expenses'
+  | 'cashbookEntries'
+  | 'products';
 
-function pickKeys(obj: Record<string, unknown>, keys: string[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const k of keys) {
-    if (obj[k] !== undefined) out[k] = obj[k];
+/**
+ * Exact mutable field allowlists synchronized verbatim with `firestore.rules`
+ * (`incoming().diff(existing()).affectedKeys().hasOnly([...])`).
+ */
+export const FIRESTORE_ALLOWED_UPDATE_KEYS: Record<FirestoreCollectionKey, readonly string[]> = {
+  stores: [
+    'storeName',
+    'ownerName',
+    'phone',
+    'address',
+    'upiId',
+    'gstin',
+    'lastClosedDate',
+    'whatsappTemplateConfig',
+    'localUpdatedAt',
+  ],
+  customers: [
+    'name',
+    'phone',
+    'address',
+    'openingBalance',
+    'currentBalance',
+    'totalCreditGiven',
+    'totalPaymentReceived',
+    'whatsappConsent',
+    'localUpdatedAt',
+  ],
+  customerTransactions: ['description', 'paymentMethod', 'invoiceNo', 'status', 'localUpdatedAt'],
+  suppliers: [
+    'name',
+    'phone',
+    'category',
+    'address',
+    'openingBalance',
+    'currentBalance',
+    'totalPurchases',
+    'totalPaid',
+    'localUpdatedAt',
+  ],
+  supplierTransactions: [
+    'paymentStatus',
+    'paymentMethod',
+    'description',
+    'invoiceNo',
+    'status',
+    'localUpdatedAt',
+  ],
+  sales: ['notes', 'paymentMethod', 'customerId', 'customerName', 'localUpdatedAt'],
+  expenses: [
+    'title',
+    'category',
+    'amount',
+    'isPersonalWithdrawal',
+    'paymentMethod',
+    'date',
+    'notes',
+    'localUpdatedAt',
+  ],
+  cashbookEntries: ['description', 'category', 'amount', 'localUpdatedAt'],
+  products: [
+    'name',
+    'category',
+    'unit',
+    'costPrice',
+    'sellingPrice',
+    'mrp',
+    'stockQty',
+    'minStockAlert',
+    'preferredSupplierId',
+    'preferredSupplierName',
+    'isArchived',
+    'localUpdatedAt',
+  ],
+};
+
+/**
+ * Pure helper: extracts only the fields allowed on `update` by `firestore.rules`.
+ * Guarantees immutable fields (`id`, `ownerId`, `createdAt`) are never overwritten.
+ */
+export function buildFirestoreUpdatePatch(
+  collectionKey: FirestoreCollectionKey,
+  fullPayload: Record<string, unknown>
+): Record<string, unknown> {
+  const allowed = FIRESTORE_ALLOWED_UPDATE_KEYS[collectionKey];
+  const patch: Record<string, unknown> = {};
+  for (const key of allowed) {
+    if (key in fullPayload && fullPayload[key] !== undefined) {
+      patch[key] = fullPayload[key];
+    }
   }
-  return out;
+  return patch;
 }
 
 /**
- * Ensures parent `/stores/{userId}` document exists (required by Master Gate rules).
+ * Pure helper: terminal transaction statuses locked by `isNotCancelled(existing())` in `firestore.rules`.
  */
-export async function ensureStoreWorkspaceDoc(
-  userId: string,
-  profile: StoreProfile,
-  lastClosedDate: string | null
-): Promise<void> {
-  const safeUid = sanitizeId(userId);
-  const ref = doc(db, 'stores', safeUid);
-  const path = `stores/${safeUid}`;
-  const payload = buildStoreWorkspacePayload(safeUid, profile, lastClosedDate);
-
-  let snap;
-  try {
-    snap = await getDoc(ref);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, path);
-  }
-
-  try {
-    if (!snap.exists()) {
-      await setDoc(ref, {
-        ...payload,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      const updatePatch = pickKeys(payload, [
-        'storeName',
-        'ownerName',
-        'phone',
-        'address',
-        'upiId',
-        'gstin',
-        'lastClosedDate',
-        'whatsappTemplateConfig',
-        'localUpdatedAt',
-      ]);
-      await updateDoc(ref, {
-        ...updatePatch,
-        updatedAt: serverTimestamp(),
-      });
-    }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, path);
-  }
+export function isTerminalTransactionStatus(status: unknown): boolean {
+  return status === 'CANCELLED' || status === 'REVERSED';
 }
 
-async function upsertSubcollectionDoc(params: {
-  userId: string;
-  subcollection: string;
-  docId: string;
-  createPayload: Record<string, unknown>;
-  updateAllowedKeys: string[];
-  localUpdatedAt: string;
-  entityLabel: string;
-  lastSyncedAt?: string;
-  allowUpdate?: boolean;
-  skipIfTerminal?: boolean;
-}): Promise<{
-  ok: boolean;
-  conflict?: {
-    remoteUpdatedAt: string;
-    remoteSnapshot: Record<string, unknown>;
-    entityLabel: string;
-  };
-  error?: string;
-}> {
-  const safeUid = sanitizeId(params.userId);
-  const safeDocId = sanitizeId(params.docId);
-  const path = `stores/${safeUid}/${params.subcollection}/${safeDocId}`;
-  const ref = doc(db, 'stores', safeUid, params.subcollection, safeDocId);
-
+/**
+ * Pure helper: extracts structured FirestoreErrorInfo if thrown by `handleFirestoreError`.
+ */
+export function parseFirestoreErrorInfo(error: unknown): {
+  message: string;
+  permissionDenied: boolean;
+  info?: FirestoreErrorInfo;
+} {
+  const raw = error instanceof Error ? error.message : String(error || 'Firestore operation failed.');
   try {
-    const snap = await getDoc(ref);
-    if (!snap.exists()) {
-      await setDoc(ref, {
-        ...params.createPayload,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-      return { ok: true };
-    }
-
-    const remoteData = snap.data() as Record<string, unknown>;
-    if (
-      params.skipIfTerminal &&
-      (remoteData.status === 'CANCELLED' || remoteData.status === 'REVERSED')
-    ) {
-      return { ok: true };
-    }
-
-    if (params.allowUpdate === false) {
-      return { ok: true };
-    }
-
-    const remoteUpdatedAt =
-      typeof remoteData.localUpdatedAt === 'string' ? remoteData.localUpdatedAt : '';
-    const localHash = computeDeterministicHash(JSON.stringify(params.createPayload));
-    const comparableRemote = pickKeys(remoteData, Object.keys(params.createPayload));
-    const remoteHash = computeDeterministicHash(JSON.stringify(comparableRemote));
-
-    if (
-      remoteUpdatedAt &&
-      detectSyncConflict({
-        localUpdatedAt: params.localUpdatedAt,
-        remoteUpdatedAt,
-        lastSyncedAt: params.lastSyncedAt,
-        localPayloadHash: localHash,
-        remotePayloadHash: remoteHash,
-      })
-    ) {
+    const parsed = JSON.parse(raw) as Partial<FirestoreErrorInfo>;
+    if (parsed && typeof parsed.error === 'string' && typeof parsed.operationType === 'string') {
+      const permissionDenied =
+        /permission[-_ ]denied|missing or insufficient permissions/i.test(parsed.error);
       return {
-        ok: false,
-        conflict: {
-          remoteUpdatedAt,
-          remoteSnapshot: remoteData,
-          entityLabel: params.entityLabel,
-        },
+        message: permissionDenied
+          ? 'Firestore denied access (Missing or insufficient permissions). Please publish firestore.rules in Firebase Console and verify your email.'
+          : parsed.error,
+        permissionDenied,
+        info: parsed as FirestoreErrorInfo,
       };
     }
-
-    const updatePatch = pickKeys(params.createPayload, params.updateAllowedKeys);
-    await updateDoc(ref, {
-      ...updatePatch,
-      updatedAt: serverTimestamp(),
-    });
-    return { ok: true };
-  } catch (err) {
-    try {
-      handleFirestoreError(err, OperationType.WRITE, path);
-    } catch (wrapped) {
-      const msg = wrapped instanceof Error ? wrapped.message : String(wrapped);
-      return { ok: false, error: msg };
-    }
+  } catch {
+    // Plain error message
   }
+  const permissionDenied = /permission[-_ ]denied|missing or insufficient permissions/i.test(raw);
+  return {
+    message: permissionDenied
+      ? 'Firestore denied access (Missing or insufficient permissions). Please publish firestore.rules in Firebase Console and verify your email.'
+      : raw,
+    permissionDenied,
+  };
 }
 
-export function createFirestoreTransportAdapter(options: {
-  userId: string;
-  emailVerified: boolean;
-  getDataset: () => StoreBusinessDataset;
-  getLocalBackups: () => LocalBackupSnapshot[];
-  getLastSyncedAt: () => string | undefined;
-}): CloudTransportAdapter {
-  const configured = Boolean(options.userId && options.emailVerified);
+function finiteNum(val: unknown, fallback = 0): number {
+  const n = Number(val);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function strVal(val: unknown, fallback = ''): string {
+  return typeof val === 'string' ? val : fallback;
+}
+
+export interface FirestorePulledDataset {
+  profilePatch: Partial<StoreProfile>;
+  lastClosedDate?: string | null;
+  customers: Customer[];
+  customerTransactions: CustomerTransaction[];
+  suppliers: Supplier[];
+  supplierTransactions: SupplierTransaction[];
+  sales: SaleRecord[];
+  expenses: ExpenseRecord[];
+  cashbookEntries: CashbookEntry[];
+  products: Product[];
+}
+
+/**
+ * Pure mapper: converts raw Firestore documents back into typed Arjun Groceries records.
+ */
+export function mapFirestoreDocsToDatasetPatch(raw: {
+  workspace: Record<string, unknown> | null;
+  customers: Record<string, unknown>[];
+  customerTransactions: Record<string, unknown>[];
+  suppliers: Record<string, unknown>[];
+  supplierTransactions: Record<string, unknown>[];
+  sales: Record<string, unknown>[];
+  expenses: Record<string, unknown>[];
+  cashbookEntries: Record<string, unknown>[];
+  products: Record<string, unknown>[];
+}): FirestorePulledDataset {
+  const ws = raw.workspace || {};
+  const profilePatch: Partial<StoreProfile> = {};
+  if (typeof ws.storeName === 'string' && ws.storeName.trim()) profilePatch.storeName = ws.storeName;
+  if (typeof ws.ownerName === 'string' && ws.ownerName.trim()) profilePatch.ownerName = ws.ownerName;
+  if (typeof ws.phone === 'string') profilePatch.phone = ws.phone;
+  if (typeof ws.address === 'string') profilePatch.address = ws.address;
+  if (typeof ws.upiId === 'string') profilePatch.upiId = ws.upiId;
+  if (typeof ws.gstin === 'string') profilePatch.gstin = ws.gstin;
+  if (ws.whatsappTemplateConfig && typeof ws.whatsappTemplateConfig === 'object') {
+    const cfg = ws.whatsappTemplateConfig as Record<string, unknown>;
+    if (typeof cfg.templateName === 'string' && typeof cfg.bodyTemplate === 'string') {
+      profilePatch.whatsappTemplateConfig = {
+        templateName: cfg.templateName,
+        bodyTemplate: cfg.bodyTemplate,
+        footerText: strVal(cfg.footerText),
+        includeInvoiceList: Boolean(cfg.includeInvoiceList),
+        includeUpiId: Boolean(cfg.includeUpiId),
+        updatedAt: strVal(cfg.updatedAt) || new Date().toISOString(),
+      };
+    }
+  }
+
+  const customers: Customer[] = raw.customers
+    .filter((d) => typeof d.id === 'string' && typeof d.name === 'string')
+    .map((d) => {
+      const currentBalance = finiteNum(d.currentBalance);
+      const rawCategory = strVal(d.category);
+      const category: Customer['category'] =
+        rawCategory === 'REGULAR' ||
+        rawCategory === 'HIGH_CREDIT' ||
+        rawCategory === 'OVERDUE' ||
+        rawCategory === 'CLEARED'
+          ? rawCategory
+          : currentBalance <= 0
+            ? 'CLEARED'
+            : 'REGULAR';
+      return {
+        id: strVal(d.id),
+        name: strVal(d.name),
+        phone: strVal(d.phone),
+        address: strVal(d.address),
+        openingBalance: finiteNum(d.openingBalance),
+        currentBalance,
+        totalCreditGiven: finiteNum(d.totalCreditGiven),
+        totalPaymentReceived: finiteNum(d.totalPaymentReceived),
+        overdueDays: finiteNum(d.overdueDays),
+        category,
+        whatsappConsent: d.whatsappConsent !== false,
+        createdAt: strVal(d.localUpdatedAt) || new Date().toISOString(),
+      };
+    });
+
+  const customerTransactions: CustomerTransaction[] = raw.customerTransactions
+    .filter((d) => typeof d.id === 'string' && typeof d.customerId === 'string')
+    .map((d) => ({
+      id: strVal(d.id),
+      customerId: strVal(d.customerId),
+      type: (strVal(d.type, 'CREDIT') as CustomerTransaction['type']),
+      amount: finiteNum(d.amount),
+      date: strVal(d.date) || new Date().toISOString().slice(0, 10),
+      description: strVal(d.description),
+      paymentMethod: (strVal(d.paymentMethod) as CustomerTransaction['paymentMethod']) || undefined,
+      invoiceNo: strVal(d.invoiceNo) || undefined,
+      status: (strVal(d.status, 'COMPLETED') as CustomerTransaction['status']),
+      createdAt: strVal(d.localUpdatedAt) || new Date().toISOString(),
+    }));
+
+  const suppliers: Supplier[] = raw.suppliers
+    .filter((d) => typeof d.id === 'string' && typeof d.name === 'string')
+    .map((d) => ({
+      id: strVal(d.id),
+      name: strVal(d.name),
+      phone: strVal(d.phone),
+      address: strVal(d.address),
+      notes: strVal(d.category) || undefined,
+      openingBalance: finiteNum(d.openingBalance),
+      currentBalance: finiteNum(d.currentBalance),
+      totalPurchases: finiteNum(d.totalPurchases),
+      totalPaid: finiteNum(d.totalPaid),
+      lastTransactionDate: strVal(d.localUpdatedAt) || undefined,
+      createdAt: strVal(d.localUpdatedAt) || new Date().toISOString(),
+    }));
+
+  const supplierTransactions: SupplierTransaction[] = raw.supplierTransactions
+    .filter((d) => typeof d.id === 'string' && typeof d.supplierId === 'string')
+    .map((d) => ({
+      id: strVal(d.id),
+      supplierId: strVal(d.supplierId),
+      type: (strVal(d.type, 'PURCHASE') as SupplierTransaction['type']),
+      amount: finiteNum(d.amount),
+      date: strVal(d.date) || new Date().toISOString().slice(0, 10),
+      paymentStatus: (strVal(d.paymentStatus, 'PAID') as SupplierTransaction['paymentStatus']),
+      paymentMethod: (strVal(d.paymentMethod) as SupplierTransaction['paymentMethod']) || undefined,
+      description: strVal(d.description),
+      invoiceNo: strVal(d.invoiceNo) || undefined,
+      status: (strVal(d.status, 'COMPLETED') as SupplierTransaction['status']),
+      createdAt: strVal(d.localUpdatedAt) || new Date().toISOString(),
+    }));
+
+  const sales: SaleRecord[] = raw.sales
+    .filter((d) => typeof d.id === 'string' && typeof d.invoiceNo === 'string')
+    .map((d) => {
+      const itemsRaw = Array.isArray(d.items) ? (d.items as Record<string, unknown>[]) : [];
+      return {
+        id: strVal(d.id),
+        invoiceNo: strVal(d.invoiceNo),
+        date: strVal(d.date) || new Date().toISOString().slice(0, 10),
+        customerId: strVal(d.customerId) || undefined,
+        customerName: strVal(d.customerName) || undefined,
+        amount: finiteNum(d.amount),
+        paymentMethod: (strVal(d.paymentMethod, 'CASH') as PaymentMethod),
+        isCredit: Boolean(d.isCredit),
+        items: itemsRaw.map((it) => ({
+          productId: strVal(it.productId),
+          productName: strVal(it.productName),
+          quantity: finiteNum(it.quantity),
+          unit: strVal(it.unit, 'pcs'),
+          rate: finiteNum(it.rate),
+          total: finiteNum(it.total),
+        })),
+        notes: strVal(d.notes) || undefined,
+        createdAt: strVal(d.localUpdatedAt) || new Date().toISOString(),
+      };
+    });
+
+  const expenses: ExpenseRecord[] = raw.expenses
+    .filter((d) => typeof d.id === 'string' && typeof d.title === 'string')
+    .map((d) => ({
+      id: strVal(d.id),
+      title: strVal(d.title),
+      category: (strVal(d.category, 'misc') as ExpenseRecord['category']),
+      amount: finiteNum(d.amount),
+      isPersonalWithdrawal: Boolean(d.isPersonalWithdrawal),
+      paymentMethod: (strVal(d.paymentMethod, 'CASH') as ExpenseRecord['paymentMethod']),
+      date: strVal(d.date) || new Date().toISOString().slice(0, 10),
+      notes: strVal(d.notes) || undefined,
+      createdAt: strVal(d.localUpdatedAt) || new Date().toISOString(),
+    }));
+
+  const cashbookEntries: CashbookEntry[] = raw.cashbookEntries
+    .filter((d) => typeof d.id === 'string')
+    .map((d) => ({
+      id: strVal(d.id),
+      date: strVal(d.date) || new Date().toISOString().slice(0, 10),
+      type: d.type === 'OUT' ? 'OUT' : 'IN',
+      category: strVal(d.category, 'GENERAL'),
+      description: strVal(d.description),
+      amount: finiteNum(d.amount),
+      paymentMode: (strVal(d.paymentMode, 'CASH') as CashbookEntry['paymentMode']),
+      refType: (strVal(d.refType, 'MANUAL') as CashbookEntry['refType']),
+      refId: strVal(d.refId) || undefined,
+      createdAt: strVal(d.localUpdatedAt) || new Date().toISOString(),
+    }));
+
+  const products: Product[] = raw.products
+    .filter((d) => typeof d.id === 'string' && typeof d.name === 'string')
+    .map((d) => ({
+      id: strVal(d.id),
+      name: strVal(d.name),
+      category: strVal(d.category, 'Grocery'),
+      unit: strVal(d.unit, 'pcs'),
+      purchasePrice: finiteNum(d.costPrice),
+      sellingPrice: finiteNum(d.sellingPrice),
+      mrp: finiteNum(d.mrp) || undefined,
+      stockQty: finiteNum(d.stockQty),
+      minStockAlert: finiteNum(d.minStockAlert, 5),
+      preferredSupplierId: strVal(d.preferredSupplierId) || undefined,
+      preferredSupplierName: strVal(d.preferredSupplierName) || undefined,
+      isArchived: Boolean(d.isArchived),
+      updatedAt: strVal(d.localUpdatedAt) || new Date().toISOString(),
+    }));
 
   return {
-    isConfigured: configured,
-    async pushRecord(item: SyncQueueItem, payload: unknown) {
-      if (!configured) {
-        return {
-          ok: false,
-          error: 'Sign in with a verified Google account to sync with Firebase Firestore.',
-        };
-      }
-
-      const ds = options.getDataset();
-      await ensureStoreWorkspaceDoc(options.userId, ds.profile, ds.lastClosedDate ?? null);
-
-      const safeUid = sanitizeId(options.userId);
-      const lastSyncedAt = options.getLastSyncedAt();
-
-      if (item.entityType === 'SETTINGS') {
-        return { ok: true };
-      }
-
-      if (item.entityType === 'CUSTOMER') {
-        const c = ds.customers.find((x) => x.id === item.entityId);
-        if (!c) return { ok: true };
-        const docPayload = buildCustomerCloudPayload(safeUid, c, item.localUpdatedAt);
-        return upsertSubcollectionDoc({
-          userId: safeUid,
-          subcollection: 'customers',
-          docId: c.id,
-          createPayload: docPayload,
-          updateAllowedKeys: [
-            'name',
-            'phone',
-            'address',
-            'openingBalance',
-            'currentBalance',
-            'totalCreditGiven',
-            'totalPaymentReceived',
-            'whatsappConsent',
-            'localUpdatedAt',
-          ],
-          localUpdatedAt: String(docPayload.localUpdatedAt),
-          entityLabel: `Customer: ${c.name}`,
-          lastSyncedAt,
-        });
-      }
-
-      if (item.entityType === 'CUSTOMER_TX') {
-        const tx = ds.customerTransactions.find((x) => x.id === item.entityId);
-        if (!tx) return { ok: true };
-        const docPayload = buildCustomerTxCloudPayload(safeUid, tx, item.localUpdatedAt);
-        return upsertSubcollectionDoc({
-          userId: safeUid,
-          subcollection: 'customerTransactions',
-          docId: tx.id,
-          createPayload: docPayload,
-          updateAllowedKeys: ['description', 'paymentMethod', 'invoiceNo', 'status', 'localUpdatedAt'],
-          localUpdatedAt: String(docPayload.localUpdatedAt),
-          entityLabel: `Customer Tx: ${tx.description || tx.id}`,
-          lastSyncedAt,
-          skipIfTerminal: true,
-        });
-      }
-
-      if (item.entityType === 'SUPPLIER') {
-        const s = ds.suppliers.find((x) => x.id === item.entityId);
-        if (!s) return { ok: true };
-        const docPayload = buildSupplierCloudPayload(safeUid, s, item.localUpdatedAt);
-        return upsertSubcollectionDoc({
-          userId: safeUid,
-          subcollection: 'suppliers',
-          docId: s.id,
-          createPayload: docPayload,
-          updateAllowedKeys: [
-            'name',
-            'phone',
-            'category',
-            'address',
-            'openingBalance',
-            'currentBalance',
-            'totalPurchases',
-            'totalPaid',
-            'localUpdatedAt',
-          ],
-          localUpdatedAt: String(docPayload.localUpdatedAt),
-          entityLabel: `Supplier: ${s.name}`,
-          lastSyncedAt,
-        });
-      }
-
-      if (item.entityType === 'SUPPLIER_TX') {
-        const tx = ds.supplierTransactions.find((x) => x.id === item.entityId);
-        if (!tx) return { ok: true };
-        const docPayload = buildSupplierTxCloudPayload(safeUid, tx, item.localUpdatedAt);
-        return upsertSubcollectionDoc({
-          userId: safeUid,
-          subcollection: 'supplierTransactions',
-          docId: tx.id,
-          createPayload: docPayload,
-          updateAllowedKeys: [
-            'paymentStatus',
-            'paymentMethod',
-            'description',
-            'invoiceNo',
-            'status',
-            'localUpdatedAt',
-          ],
-          localUpdatedAt: String(docPayload.localUpdatedAt),
-          entityLabel: `Supplier Tx: ${tx.description || tx.id}`,
-          lastSyncedAt,
-          skipIfTerminal: true,
-        });
-      }
-
-      if (item.entityType === 'SALE') {
-        const sale = ds.sales.find((x) => x.id === item.entityId);
-        if (!sale) return { ok: true };
-        const docPayload = buildSaleCloudPayload(safeUid, sale, item.localUpdatedAt);
-        return upsertSubcollectionDoc({
-          userId: safeUid,
-          subcollection: 'sales',
-          docId: sale.id,
-          createPayload: docPayload,
-          updateAllowedKeys: ['notes', 'paymentMethod', 'customerId', 'customerName', 'localUpdatedAt'],
-          localUpdatedAt: String(docPayload.localUpdatedAt),
-          entityLabel: `Invoice #${sale.invoiceNo}`,
-          lastSyncedAt,
-        });
-      }
-
-      if (item.entityType === 'EXPENSE') {
-        const exp = ds.expenses.find((x) => x.id === item.entityId);
-        if (!exp) return { ok: true };
-        const docPayload = buildExpenseCloudPayload(safeUid, exp, item.localUpdatedAt);
-        return upsertSubcollectionDoc({
-          userId: safeUid,
-          subcollection: 'expenses',
-          docId: exp.id,
-          createPayload: docPayload,
-          updateAllowedKeys: [
-            'title',
-            'category',
-            'amount',
-            'isPersonalWithdrawal',
-            'paymentMethod',
-            'date',
-            'notes',
-            'localUpdatedAt',
-          ],
-          localUpdatedAt: String(docPayload.localUpdatedAt),
-          entityLabel: `Expense: ${exp.title}`,
-          lastSyncedAt,
-        });
-      }
-
-      if (item.entityType === 'CASHBOOK') {
-        const cb = ds.cashbookEntries.find((x) => x.id === item.entityId);
-        if (!cb) return { ok: true };
-        const docPayload = buildCashbookCloudPayload(safeUid, cb, item.localUpdatedAt);
-        return upsertSubcollectionDoc({
-          userId: safeUid,
-          subcollection: 'cashbookEntries',
-          docId: cb.id,
-          createPayload: docPayload,
-          updateAllowedKeys: ['description', 'category', 'amount', 'localUpdatedAt'],
-          localUpdatedAt: String(docPayload.localUpdatedAt),
-          entityLabel: `Cashbook: ${cb.description}`,
-          lastSyncedAt,
-        });
-      }
-
-      if (item.entityType === 'PRODUCT') {
-        const prod = ds.products.find((x) => x.id === item.entityId);
-        if (!prod) return { ok: true };
-        const docPayload = buildProductCloudPayload(safeUid, prod, item.localUpdatedAt);
-        return upsertSubcollectionDoc({
-          userId: safeUid,
-          subcollection: 'products',
-          docId: prod.id,
-          createPayload: docPayload,
-          updateAllowedKeys: [
-            'name',
-            'category',
-            'unit',
-            'costPrice',
-            'sellingPrice',
-            'mrp',
-            'stockQty',
-            'minStockAlert',
-            'preferredSupplierId',
-            'preferredSupplierName',
-            'isArchived',
-            'localUpdatedAt',
-          ],
-          localUpdatedAt: String(docPayload.localUpdatedAt),
-          entityLabel: `Product: ${prod.name}`,
-          lastSyncedAt,
-        });
-      }
-
-      if (item.entityType === 'BACKUP_META') {
-        const snap = options.getLocalBackups().find((x) => x.id === item.entityId);
-        if (!snap) return { ok: true };
-        const docPayload = buildBackupManifestCloudPayload(safeUid, snap);
-        return upsertSubcollectionDoc({
-          userId: safeUid,
-          subcollection: 'backupManifests',
-          docId: snap.id,
-          createPayload: docPayload,
-          updateAllowedKeys: [],
-          localUpdatedAt: snap.createdAt,
-          entityLabel: `Backup ${snap.bucket}`,
-          lastSyncedAt,
-          allowUpdate: false,
-        });
-      }
-
-      // Suppress unused param lint warning when fallback is skipped
-      void payload;
-      return { ok: true };
-    },
+    profilePatch,
+    lastClosedDate: typeof ws.lastClosedDate === 'string' && ws.lastClosedDate ? ws.lastClosedDate : null,
+    customers,
+    customerTransactions,
+    suppliers,
+    supplierTransactions,
+    sales,
+    expenses,
+    cashbookEntries,
+    products,
   };
 }
 
 /**
- * Syncs a complete local store dataset cleanly to Firestore (used on initial Cloud Sync or manual Sync Now).
+ * Ensures the root `/stores/{uid}` workspace document exists and is up to date.
+ * Satisfies the Master Gate parent invariant required before any subcollection write.
  */
-export async function syncFullDatasetToCloud(
-  userId: string,
-  dataset: StoreBusinessDataset,
-  localBackups: LocalBackupSnapshot[],
-  lastSyncedAt?: string
-): Promise<{ syncedCount: number; conflictCount: number; failedCount: number }> {
-  const safeUid = sanitizeId(userId);
-  await ensureStoreWorkspaceDoc(safeUid, dataset.profile, dataset.lastClosedDate ?? null);
+export async function ensureStoreWorkspaceDoc(
+  uid: string,
+  profile: StoreProfile,
+  lastClosedDate: string | null = null
+): Promise<void> {
+  const path = `stores/${uid}`;
+  const ref = doc(db, 'stores', uid);
+  const fullPayload = buildStoreWorkspacePayload(uid, profile, lastClosedDate);
 
-  let syncedCount = 1; // root workspace
-  let conflictCount = 0;
-  let failedCount = 0;
-
-  const jobs: Array<() => Promise<{ ok: boolean; conflict?: unknown }>> = [
-    ...dataset.customers.map((c) => () => {
-      const p = buildCustomerCloudPayload(safeUid, c);
-      return upsertSubcollectionDoc({
-        userId: safeUid,
-        subcollection: 'customers',
-        docId: c.id,
-        createPayload: p,
-        updateAllowedKeys: [
-          'name',
-          'phone',
-          'address',
-          'openingBalance',
-          'currentBalance',
-          'totalCreditGiven',
-          'totalPaymentReceived',
-          'whatsappConsent',
-          'localUpdatedAt',
-        ],
-        localUpdatedAt: String(p.localUpdatedAt),
-        entityLabel: `Customer: ${c.name}`,
-        lastSyncedAt,
-      });
-    }),
-    ...dataset.customerTransactions.map((tx) => () => {
-      const p = buildCustomerTxCloudPayload(safeUid, tx);
-      return upsertSubcollectionDoc({
-        userId: safeUid,
-        subcollection: 'customerTransactions',
-        docId: tx.id,
-        createPayload: p,
-        updateAllowedKeys: ['description', 'paymentMethod', 'invoiceNo', 'status', 'localUpdatedAt'],
-        localUpdatedAt: String(p.localUpdatedAt),
-        entityLabel: `Customer Tx: ${tx.description || tx.id}`,
-        lastSyncedAt,
-        skipIfTerminal: true,
-      });
-    }),
-    ...dataset.suppliers.map((s) => () => {
-      const p = buildSupplierCloudPayload(safeUid, s);
-      return upsertSubcollectionDoc({
-        userId: safeUid,
-        subcollection: 'suppliers',
-        docId: s.id,
-        createPayload: p,
-        updateAllowedKeys: [
-          'name',
-          'phone',
-          'category',
-          'address',
-          'openingBalance',
-          'currentBalance',
-          'totalPurchases',
-          'totalPaid',
-          'localUpdatedAt',
-        ],
-        localUpdatedAt: String(p.localUpdatedAt),
-        entityLabel: `Supplier: ${s.name}`,
-        lastSyncedAt,
-      });
-    }),
-    ...dataset.supplierTransactions.map((tx) => () => {
-      const p = buildSupplierTxCloudPayload(safeUid, tx);
-      return upsertSubcollectionDoc({
-        userId: safeUid,
-        subcollection: 'supplierTransactions',
-        docId: tx.id,
-        createPayload: p,
-        updateAllowedKeys: [
-          'paymentStatus',
-          'paymentMethod',
-          'description',
-          'invoiceNo',
-          'status',
-          'localUpdatedAt',
-        ],
-        localUpdatedAt: String(p.localUpdatedAt),
-        entityLabel: `Supplier Tx: ${tx.description || tx.id}`,
-        lastSyncedAt,
-        skipIfTerminal: true,
-      });
-    }),
-    ...dataset.sales.map((s) => () => {
-      const p = buildSaleCloudPayload(safeUid, s);
-      return upsertSubcollectionDoc({
-        userId: safeUid,
-        subcollection: 'sales',
-        docId: s.id,
-        createPayload: p,
-        updateAllowedKeys: ['notes', 'paymentMethod', 'customerId', 'customerName', 'localUpdatedAt'],
-        localUpdatedAt: String(p.localUpdatedAt),
-        entityLabel: `Invoice #${s.invoiceNo}`,
-        lastSyncedAt,
-      });
-    }),
-    ...dataset.expenses.map((e) => () => {
-      const p = buildExpenseCloudPayload(safeUid, e);
-      return upsertSubcollectionDoc({
-        userId: safeUid,
-        subcollection: 'expenses',
-        docId: e.id,
-        createPayload: p,
-        updateAllowedKeys: [
-          'title',
-          'category',
-          'amount',
-          'isPersonalWithdrawal',
-          'paymentMethod',
-          'date',
-          'notes',
-          'localUpdatedAt',
-        ],
-        localUpdatedAt: String(p.localUpdatedAt),
-        entityLabel: `Expense: ${e.title}`,
-        lastSyncedAt,
-      });
-    }),
-    ...dataset.cashbookEntries.map((cb) => () => {
-      const p = buildCashbookCloudPayload(safeUid, cb);
-      return upsertSubcollectionDoc({
-        userId: safeUid,
-        subcollection: 'cashbookEntries',
-        docId: cb.id,
-        createPayload: p,
-        updateAllowedKeys: ['description', 'category', 'amount', 'localUpdatedAt'],
-        localUpdatedAt: String(p.localUpdatedAt),
-        entityLabel: `Cashbook: ${cb.description}`,
-        lastSyncedAt,
-      });
-    }),
-    ...dataset.products.map((prod) => () => {
-      const p = buildProductCloudPayload(safeUid, prod);
-      return upsertSubcollectionDoc({
-        userId: safeUid,
-        subcollection: 'products',
-        docId: prod.id,
-        createPayload: p,
-        updateAllowedKeys: [
-          'name',
-          'category',
-          'unit',
-          'costPrice',
-          'sellingPrice',
-          'mrp',
-          'stockQty',
-          'minStockAlert',
-          'preferredSupplierId',
-          'preferredSupplierName',
-          'isArchived',
-          'localUpdatedAt',
-        ],
-        localUpdatedAt: String(p.localUpdatedAt),
-        entityLabel: `Product: ${prod.name}`,
-        lastSyncedAt,
-      });
-    }),
-    ...localBackups.slice(0, 5).map((snap) => () => {
-      const p = buildBackupManifestCloudPayload(safeUid, snap);
-      return upsertSubcollectionDoc({
-        userId: safeUid,
-        subcollection: 'backupManifests',
-        docId: snap.id,
-        createPayload: p,
-        updateAllowedKeys: [],
-        localUpdatedAt: snap.createdAt,
-        entityLabel: `Backup ${snap.bucket}`,
-        lastSyncedAt,
-        allowUpdate: false,
-      });
-    }),
-  ];
-
-  for (const job of jobs) {
-    const res = await job();
-    if (res.ok) syncedCount++;
-    else if (res.conflict) conflictCount++;
-    else failedCount++;
+  let exists = false;
+  try {
+    const snap = await getDoc(ref);
+    exists = snap.exists();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
   }
 
-  return { syncedCount, conflictCount, failedCount };
+  if (!exists) {
+    try {
+      await setDoc(ref, {
+        ...fullPayload,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, path);
+    }
+  } else {
+    const patch = buildFirestoreUpdatePatch('stores', fullPayload);
+    try {
+      await updateDoc(ref, {
+        ...patch,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
+}
+
+interface PendingBatchOp {
+  type: 'create' | 'update';
+  path: string;
+  collectionKey: Exclude<FirestoreCollectionKey, 'stores'>;
+  docId: string;
+  data: Record<string, unknown>;
+}
+
+const MAX_BATCH_OPS = 380;
+
+async function commitBatchedOps(uid: string, ops: PendingBatchOp[]): Promise<void> {
+  for (let i = 0; i < ops.length; i += MAX_BATCH_OPS) {
+    const chunk = ops.slice(i, i + MAX_BATCH_OPS);
+    const batch = writeBatch(db);
+    for (const op of chunk) {
+      const ref = doc(db, 'stores', uid, op.collectionKey, op.docId);
+      if (op.type === 'create') {
+        batch.set(ref, {
+          ...op.data,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        batch.update(ref, {
+          ...op.data,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
+    const firstPath = chunk[0]?.path || `stores/${uid}`;
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, firstPath);
+    }
+  }
+}
+
+async function listExistingDocMeta(
+  uid: string,
+  subcollection: Exclude<FirestoreCollectionKey, 'stores'>
+): Promise<Map<string, Record<string, unknown>>> {
+  const path = `stores/${uid}/${subcollection}`;
+  try {
+    const q = query(collection(db, 'stores', uid, subcollection), where('ownerId', '==', uid));
+    const snap = await getDocs(q);
+    const result = new Map<string, Record<string, unknown>>();
+    snap.forEach((docSnap) => {
+      result.set(docSnap.id, docSnap.data() as Record<string, unknown>);
+    });
+    return result;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, path);
+  }
 }
 
 /**
- * Pulls the authenticated owner's Firestore cloud data for recovery onto a new/reset device.
+ * Syncs the full local Arjun Groceries business dataset to Cloud Firestore under `/stores/{uid}/...`.
+ * Strictly obeys `firestore.rules` (Master Gate, strict keys, `affectedKeys().hasOnly(...)`,
+ * terminal transaction immutability, and server timestamps). Never modifies local IndexedDB.
  */
-export async function pullStoreDatasetFromCloud(
-  userId: string,
-  baseDataset: StoreBusinessDataset
-): Promise<{ found: boolean; dataset?: StoreBusinessDataset; recordCount: number }> {
-  const safeUid = sanitizeId(userId);
-  const storePath = `stores/${safeUid}`;
-  try {
-    const storeSnap = await getDoc(doc(db, 'stores', safeUid));
-    if (!storeSnap.exists()) {
-      return { found: false, recordCount: 0 };
+export async function syncDatasetToFirestore(
+  uid: string,
+  dataset: StoreBusinessDataset
+): Promise<{ syncedCounts: FirestoreSyncedCounts; syncedAt: string }> {
+  // 1. Ensure parent `/stores/{uid}` exists first (Master Gate)
+  await ensureStoreWorkspaceDoc(uid, dataset.profile, dataset.lastClosedDate ?? null);
+
+  // 2. Inspect existing remote doc IDs so we use `create` for new docs and allowlisted `update` for existing docs
+  const [
+    existingCustomers,
+    existingCustomerTx,
+    existingSuppliers,
+    existingSupplierTx,
+    existingSales,
+    existingExpenses,
+    existingCashbook,
+    existingProducts,
+  ] = await Promise.all([
+    listExistingDocMeta(uid, 'customers'),
+    listExistingDocMeta(uid, 'customerTransactions'),
+    listExistingDocMeta(uid, 'suppliers'),
+    listExistingDocMeta(uid, 'supplierTransactions'),
+    listExistingDocMeta(uid, 'sales'),
+    listExistingDocMeta(uid, 'expenses'),
+    listExistingDocMeta(uid, 'cashbookEntries'),
+    listExistingDocMeta(uid, 'products'),
+  ]);
+
+  const ops: PendingBatchOp[] = [];
+  const nowIso = new Date().toISOString();
+
+  const enqueueCollection = (
+    sub: Exclude<FirestoreCollectionKey, 'stores'>,
+    payloads: Record<string, unknown>[],
+    existingMap: Map<string, Record<string, unknown>>,
+    respectTerminalStatus = false
+  ) => {
+    for (const fullPayload of payloads) {
+      const docId = String(fullPayload.id || '');
+      if (!docId) continue;
+      const remoteDoc = existingMap.get(docId);
+      if (!remoteDoc) {
+        ops.push({
+          type: 'create',
+          path: `stores/${uid}/${sub}/${docId}`,
+          collectionKey: sub,
+          docId,
+          data: fullPayload,
+        });
+      } else {
+        if (respectTerminalStatus && isTerminalTransactionStatus(remoteDoc.status)) {
+          continue;
+        }
+        ops.push({
+          type: 'update',
+          path: `stores/${uid}/${sub}/${docId}`,
+          collectionKey: sub,
+          docId,
+          data: buildFirestoreUpdatePatch(sub, fullPayload),
+        });
+      }
     }
-    const storeData = storeSnap.data();
+  };
 
-    const [
-      custSnaps,
-      custTxSnaps,
-      supSnaps,
-      supTxSnaps,
-      saleSnaps,
-      expSnaps,
-      cbSnaps,
-      prodSnaps,
-    ] = await Promise.all([
-      getDocs(query(collection(db, 'stores', safeUid, 'customers'), where('ownerId', '==', safeUid))),
-      getDocs(
-        query(collection(db, 'stores', safeUid, 'customerTransactions'), where('ownerId', '==', safeUid))
-      ),
-      getDocs(query(collection(db, 'stores', safeUid, 'suppliers'), where('ownerId', '==', safeUid))),
-      getDocs(
-        query(collection(db, 'stores', safeUid, 'supplierTransactions'), where('ownerId', '==', safeUid))
-      ),
-      getDocs(query(collection(db, 'stores', safeUid, 'sales'), where('ownerId', '==', safeUid))),
-      getDocs(query(collection(db, 'stores', safeUid, 'expenses'), where('ownerId', '==', safeUid))),
-      getDocs(query(collection(db, 'stores', safeUid, 'cashbookEntries'), where('ownerId', '==', safeUid))),
-      getDocs(query(collection(db, 'stores', safeUid, 'products'), where('ownerId', '==', safeUid))),
-    ]);
+  enqueueCollection(
+    'customers',
+    dataset.customers.map((c) => buildCustomerCloudPayload(uid, c, nowIso)),
+    existingCustomers
+  );
+  enqueueCollection(
+    'customerTransactions',
+    dataset.customerTransactions.map((tx) => buildCustomerTxCloudPayload(uid, tx, nowIso)),
+    existingCustomerTx,
+    true
+  );
+  enqueueCollection(
+    'suppliers',
+    dataset.suppliers.map((s) => buildSupplierCloudPayload(uid, s, nowIso)),
+    existingSuppliers
+  );
+  enqueueCollection(
+    'supplierTransactions',
+    dataset.supplierTransactions.map((tx) => buildSupplierTxCloudPayload(uid, tx, nowIso)),
+    existingSupplierTx,
+    true
+  );
+  enqueueCollection(
+    'sales',
+    dataset.sales.map((s) => buildSaleCloudPayload(uid, s, nowIso)),
+    existingSales
+  );
+  enqueueCollection(
+    'expenses',
+    dataset.expenses.map((e) => buildExpenseCloudPayload(uid, e, nowIso)),
+    existingExpenses
+  );
+  enqueueCollection(
+    'cashbookEntries',
+    dataset.cashbookEntries.map((c) => buildCashbookCloudPayload(uid, c, nowIso)),
+    existingCashbook
+  );
+  enqueueCollection(
+    'products',
+    dataset.products.map((p) => buildProductCloudPayload(uid, p, nowIso)),
+    existingProducts
+  );
 
-    const customers: Customer[] = custSnaps.docs.map((d) => {
-      const x = d.data();
-      return {
-        id: String(x.id || d.id),
-        name: String(x.name || ''),
-        phone: String(x.phone || ''),
-        address: String(x.address || ''),
-        openingBalance: Number(x.openingBalance) || 0,
-        currentBalance: Number(x.currentBalance) || 0,
-        totalCreditGiven: Number(x.totalCreditGiven) || 0,
-        totalPaymentReceived: Number(x.totalPaymentReceived) || 0,
-        overdueDays: 0,
-        category: 'REGULAR',
-        createdAt: String(x.localUpdatedAt || new Date().toISOString()),
-        whatsappConsent: x.whatsappConsent !== false,
-      };
-    });
-
-    const customerTransactions: CustomerTransaction[] = custTxSnaps.docs.map((d) => {
-      const x = d.data();
-      return {
-        id: String(x.id || d.id),
-        customerId: String(x.customerId || ''),
-        type: (x.type as CustomerTransaction['type']) || 'CREDIT',
-        amount: Number(x.amount) || 0,
-        date: String(x.date || new Date().toISOString()),
-        description: String(x.description || ''),
-        paymentMethod: (x.paymentMethod as CustomerTransaction['paymentMethod']) || 'CASH',
-        invoiceNo: x.invoiceNo ? String(x.invoiceNo) : undefined,
-        status:
-          x.status === 'CANCELLED' || x.status === 'REVERSED' || x.status === 'COMPLETED'
-            ? (x.status as CustomerTransaction['status'])
-            : 'COMPLETED',
-        createdAt: String(x.localUpdatedAt || new Date().toISOString()),
-      };
-    });
-
-    const suppliers: Supplier[] = supSnaps.docs.map((d) => {
-      const x = d.data();
-      return {
-        id: String(x.id || d.id),
-        name: String(x.name || ''),
-        phone: String(x.phone || ''),
-        address: String(x.address || ''),
-        notes: x.category ? String(x.category) : undefined,
-        openingBalance: Number(x.openingBalance) || 0,
-        currentBalance: Number(x.currentBalance) || 0,
-        totalPurchases: Number(x.totalPurchases) || 0,
-        totalPaid: Number(x.totalPaid) || 0,
-        createdAt: String(x.localUpdatedAt || new Date().toISOString()),
-      };
-    });
-
-    const supplierTransactions: SupplierTransaction[] = supTxSnaps.docs.map((d) => {
-      const x = d.data();
-      return {
-        id: String(x.id || d.id),
-        supplierId: String(x.supplierId || ''),
-        type: (x.type as SupplierTransaction['type']) || 'PURCHASE',
-        amount: Number(x.amount) || 0,
-        date: String(x.date || new Date().toISOString()),
-        paymentStatus: (x.paymentStatus as SupplierTransaction['paymentStatus']) || 'PAID',
-        paymentMethod: (x.paymentMethod as SupplierTransaction['paymentMethod']) || 'BANK',
-        description: String(x.description || ''),
-        invoiceNo: x.invoiceNo ? String(x.invoiceNo) : undefined,
-        status:
-          x.status === 'CANCELLED' || x.status === 'REVERSED' || x.status === 'COMPLETED'
-            ? (x.status as SupplierTransaction['status'])
-            : 'COMPLETED',
-        createdAt: String(x.localUpdatedAt || new Date().toISOString()),
-      };
-    });
-
-    const sales: SaleRecord[] = saleSnaps.docs.map((d) => {
-      const x = d.data();
-      return {
-        id: String(x.id || d.id),
-        invoiceNo: String(x.invoiceNo || d.id),
-        date: String(x.date || new Date().toISOString()),
-        customerId: x.customerId ? String(x.customerId) : undefined,
-        customerName: x.customerName ? String(x.customerName) : undefined,
-        amount: Number(x.amount) || 0,
-        paymentMethod: (x.paymentMethod as SaleRecord['paymentMethod']) || 'CASH',
-        items: Array.isArray(x.items) ? (x.items as SaleRecord['items']) : [],
-        notes: x.notes ? String(x.notes) : undefined,
-        isCredit: Boolean(x.isCredit),
-        createdAt: String(x.localUpdatedAt || new Date().toISOString()),
-      };
-    });
-
-    const expenses: ExpenseRecord[] = expSnaps.docs.map((d) => {
-      const x = d.data();
-      return {
-        id: String(x.id || d.id),
-        title: String(x.title || ''),
-        category: (x.category as ExpenseRecord['category']) || 'OTHER',
-        amount: Number(x.amount) || 0,
-        isPersonalWithdrawal: Boolean(x.isPersonalWithdrawal),
-        paymentMethod: (x.paymentMethod as ExpenseRecord['paymentMethod']) || 'CASH',
-        date: String(x.date || new Date().toISOString().split('T')[0]),
-        notes: x.notes ? String(x.notes) : undefined,
-        createdAt: String(x.localUpdatedAt || new Date().toISOString()),
-      };
-    });
-
-    const cashbookEntries: CashbookEntry[] = cbSnaps.docs.map((d) => {
-      const x = d.data();
-      return {
-        id: String(x.id || d.id),
-        date: String(x.date || new Date().toISOString().split('T')[0]),
-        type: x.type === 'OUT' ? 'OUT' : 'IN',
-        category: String(x.category || 'GENERAL'),
-        description: String(x.description || ''),
-        amount: Number(x.amount) || 0,
-        paymentMode: 'CASH',
-        refType: (x.refType as CashbookEntry['refType']) || 'MANUAL',
-        refId: x.refId ? String(x.refId) : undefined,
-        createdAt: String(x.localUpdatedAt || new Date().toISOString()),
-      };
-    });
-
-    const products: Product[] = prodSnaps.docs.map((d) => {
-      const x = d.data();
-      return {
-        id: String(x.id || d.id),
-        name: String(x.name || ''),
-        category: String(x.category || 'Grocery'),
-        unit: String(x.unit || 'pcs'),
-        purchasePrice: Number(x.costPrice) || 0,
-        sellingPrice: Number(x.sellingPrice) || 0,
-        mrp: x.mrp !== undefined ? Number(x.mrp) : undefined,
-        stockQty: Number(x.stockQty) || 0,
-        minStockAlert: Number(x.minStockAlert) || 0,
-        preferredSupplierId: x.preferredSupplierId ? String(x.preferredSupplierId) : undefined,
-        preferredSupplierName: x.preferredSupplierName ? String(x.preferredSupplierName) : undefined,
-        isArchived: Boolean(x.isArchived),
-        updatedAt: String(x.localUpdatedAt || new Date().toISOString()),
-      };
-    });
-
-    const mergedProfile: StoreProfile = {
-      ...baseDataset.profile,
-      storeName: String(storeData.storeName || baseDataset.profile.storeName),
-      ownerName: String(storeData.ownerName || baseDataset.profile.ownerName),
-      phone: String(storeData.phone || baseDataset.profile.phone),
-      address: String(storeData.address || baseDataset.profile.address),
-      upiId: String(storeData.upiId || baseDataset.profile.upiId),
-      gstin: storeData.gstin ? String(storeData.gstin) : baseDataset.profile.gstin,
-      whatsappTemplateConfig:
-        storeData.whatsappTemplateConfig || baseDataset.profile.whatsappTemplateConfig,
-    };
-
-    const recordCount =
-      customers.length +
-      customerTransactions.length +
-      suppliers.length +
-      supplierTransactions.length +
-      sales.length +
-      expenses.length +
-      cashbookEntries.length +
-      products.length;
-
-    return {
-      found: true,
-      recordCount,
-      dataset: {
-        ...baseDataset,
-        profile: mergedProfile,
-        customers: customers.length > 0 ? customers : baseDataset.customers,
-        customerTransactions:
-          customerTransactions.length > 0 ? customerTransactions : baseDataset.customerTransactions,
-        suppliers: suppliers.length > 0 ? suppliers : baseDataset.suppliers,
-        supplierTransactions:
-          supplierTransactions.length > 0 ? supplierTransactions : baseDataset.supplierTransactions,
-        sales: sales.length > 0 ? sales : baseDataset.sales,
-        expenses: expenses.length > 0 ? expenses : baseDataset.expenses,
-        cashbookEntries:
-          cashbookEntries.length > 0 ? cashbookEntries : baseDataset.cashbookEntries,
-        products: products.length > 0 ? products : baseDataset.products,
-        lastClosedDate: storeData.lastClosedDate
-          ? String(storeData.lastClosedDate)
-          : baseDataset.lastClosedDate,
-      },
-    };
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, storePath);
+  if (ops.length > 0) {
+    await commitBatchedOps(uid, ops);
   }
+
+  return {
+    syncedCounts: {
+      customers: dataset.customers.length,
+      customerTransactions: dataset.customerTransactions.length,
+      suppliers: dataset.suppliers.length,
+      supplierTransactions: dataset.supplierTransactions.length,
+      sales: dataset.sales.length,
+      expenses: dataset.expenses.length,
+      cashbookEntries: dataset.cashbookEntries.length,
+      products: dataset.products.length,
+    },
+    syncedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Fetches the store workspace and all synced subcollections from Cloud Firestore for `uid`.
+ * Uses `where('ownerId', '==', uid)` on every list query to satisfy `firestore.rules`.
+ */
+export async function fetchDatasetFromFirestore(uid: string): Promise<FirestorePulledDataset | null> {
+  const wsPath = `stores/${uid}`;
+  let workspaceData: Record<string, unknown> | null = null;
+  try {
+    const wsSnap = await getDoc(doc(db, 'stores', uid));
+    if (!wsSnap.exists()) {
+      return null;
+    }
+    workspaceData = wsSnap.data() as Record<string, unknown>;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, wsPath);
+  }
+
+  const [
+    customersMap,
+    customerTxMap,
+    suppliersMap,
+    supplierTxMap,
+    salesMap,
+    expensesMap,
+    cashbookMap,
+    productsMap,
+  ] = await Promise.all([
+    listExistingDocMeta(uid, 'customers'),
+    listExistingDocMeta(uid, 'customerTransactions'),
+    listExistingDocMeta(uid, 'suppliers'),
+    listExistingDocMeta(uid, 'supplierTransactions'),
+    listExistingDocMeta(uid, 'sales'),
+    listExistingDocMeta(uid, 'expenses'),
+    listExistingDocMeta(uid, 'cashbookEntries'),
+    listExistingDocMeta(uid, 'products'),
+  ]);
+
+  return mapFirestoreDocsToDatasetPatch({
+    workspace: workspaceData,
+    customers: Array.from(customersMap.values()),
+    customerTransactions: Array.from(customerTxMap.values()),
+    suppliers: Array.from(suppliersMap.values()),
+    supplierTransactions: Array.from(supplierTxMap.values()),
+    sales: Array.from(salesMap.values()),
+    expenses: Array.from(expensesMap.values()),
+    cashbookEntries: Array.from(cashbookMap.values()),
+    products: Array.from(productsMap.values()),
+  });
 }

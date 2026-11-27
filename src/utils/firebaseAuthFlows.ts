@@ -405,6 +405,158 @@ export function resolvePasswordResetIdentifier(params: {
   };
 }
 
+export interface EmailPasswordSignInInput {
+  email: string;
+  password: string;
+}
+
+export interface ValidatedEmailPasswordSignIn {
+  valid: boolean;
+  error?: string;
+  data?: {
+    email: string;
+    password: string;
+  };
+}
+
+export function validateEmailPasswordSignInInput(
+  input: EmailPasswordSignInInput
+): ValidatedEmailPasswordSignIn {
+  const email = String(input.email || '').trim().toLowerCase();
+  const password = String(input.password || '');
+
+  if (!email) {
+    return { valid: false, error: 'Please enter your email address.' };
+  }
+  if (!isValidEmailAddress(email)) {
+    return { valid: false, error: 'Please enter a valid email address (for example, owner@example.com).' };
+  }
+  if (!password) {
+    return { valid: false, error: 'Please enter your password.' };
+  }
+  if (password.length < STORE_WORKSPACE_LIMITS.passwordMin) {
+    return {
+      valid: false,
+      error: `Password must be at least ${STORE_WORKSPACE_LIMITS.passwordMin} characters.`,
+    };
+  }
+  return { valid: true, data: { email, password } };
+}
+
+export interface EmailPasswordSignUpInput {
+  storeName: string;
+  ownerName: string;
+  email: string;
+  password: string;
+  confirmPassword: string;
+  mobile?: string;
+  address?: string;
+  upiId?: string;
+  gstin?: string;
+}
+
+export interface ValidatedEmailPasswordSignUp {
+  valid: boolean;
+  error?: string;
+  data?: {
+    storeName: string;
+    ownerName: string;
+    email: string;
+    password: string;
+    normalizedMobile?: string;
+    address: string;
+    upiId: string;
+    gstin: string;
+  };
+}
+
+export function validateEmailPasswordSignUpInput(
+  input: EmailPasswordSignUpInput
+): ValidatedEmailPasswordSignUp {
+  const storeName = String(input.storeName || '').trim();
+  const ownerName = String(input.ownerName || '').trim();
+  const email = String(input.email || '').trim().toLowerCase();
+  const password = String(input.password || '');
+  const confirmPassword = String(input.confirmPassword || '');
+  const rawMobile = String(input.mobile || '').trim();
+  const normalizedMobile = rawMobile ? normalizeMobileDigits(rawMobile) : undefined;
+  const address = String(input.address || '').trim();
+  const upiId = String(input.upiId || '').trim();
+  const gstin = String(input.gstin || '').trim().toUpperCase();
+
+  if (storeName.length < STORE_WORKSPACE_LIMITS.storeNameMin) {
+    return { valid: false, error: 'Please enter your store or shop name (at least 2 characters).' };
+  }
+  if (storeName.length > STORE_WORKSPACE_LIMITS.storeNameMax) {
+    return {
+      valid: false,
+      error: `Store name must be ${STORE_WORKSPACE_LIMITS.storeNameMax} characters or fewer.`,
+    };
+  }
+  if (ownerName.length < STORE_WORKSPACE_LIMITS.ownerNameMin) {
+    return { valid: false, error: 'Please enter the owner full name (at least 2 characters).' };
+  }
+  if (ownerName.length > STORE_WORKSPACE_LIMITS.ownerNameMax) {
+    return {
+      valid: false,
+      error: `Owner name must be ${STORE_WORKSPACE_LIMITS.ownerNameMax} characters or fewer.`,
+    };
+  }
+  if (!isValidEmailAddress(email)) {
+    return { valid: false, error: 'Please enter a valid email address.' };
+  }
+  if (password.length < STORE_WORKSPACE_LIMITS.passwordMin) {
+    return {
+      valid: false,
+      error: `Password must be at least ${STORE_WORKSPACE_LIMITS.passwordMin} characters.`,
+    };
+  }
+  if (password.length > STORE_WORKSPACE_LIMITS.passwordMax) {
+    return {
+      valid: false,
+      error: `Password must be ${STORE_WORKSPACE_LIMITS.passwordMax} characters or fewer.`,
+    };
+  }
+  if (password !== confirmPassword) {
+    return { valid: false, error: 'Password and Confirm Password do not match.' };
+  }
+  if (normalizedMobile && (normalizedMobile.length < 10 || normalizedMobile.length > 15)) {
+    return { valid: false, error: 'If provided, mobile number must be a valid 10-digit number.' };
+  }
+  if (address.length > STORE_WORKSPACE_LIMITS.addressMax) {
+    return {
+      valid: false,
+      error: `Store address must be ${STORE_WORKSPACE_LIMITS.addressMax} characters or fewer.`,
+    };
+  }
+  if (upiId.length > STORE_WORKSPACE_LIMITS.upiIdMax) {
+    return {
+      valid: false,
+      error: `UPI ID must be ${STORE_WORKSPACE_LIMITS.upiIdMax} characters or fewer.`,
+    };
+  }
+  if (gstin.length > STORE_WORKSPACE_LIMITS.gstinMax) {
+    return {
+      valid: false,
+      error: `GSTIN must be ${STORE_WORKSPACE_LIMITS.gstinMax} characters or fewer.`,
+    };
+  }
+
+  return {
+    valid: true,
+    data: {
+      storeName,
+      ownerName,
+      email,
+      password,
+      normalizedMobile,
+      address,
+      upiId,
+      gstin,
+    },
+  };
+}
+
 export interface MappedFirebaseAuthError {
   message: string;
   providerDisabled?: boolean;
@@ -415,10 +567,22 @@ export function mapFirebaseAuthErrorToMessage(error: unknown): MappedFirebaseAut
   const rawMessage = error instanceof Error ? error.message : String(error || '');
 
   switch (code) {
+    case 'auth/invalid-credential':
+    case 'auth/wrong-password':
+    case 'auth/user-not-found':
+    case 'auth/invalid-login-credentials':
+      return {
+        message:
+          'Invalid email or password. Please check your credentials or use Forgot password to reset.',
+      };
+    case 'auth/user-disabled':
+      return {
+        message: 'This account has been disabled. Please contact your store administrator.',
+      };
     case 'auth/email-already-in-use':
       return {
         message:
-          'An account already exists with this email address. Use Forgot Password on the Login screen to reset your password, or sign in with Google.',
+          'An account already exists with this email address. Please sign in or use Forgot password to reset.',
       };
     case 'auth/invalid-email':
       return {
@@ -432,7 +596,30 @@ export function mapFirebaseAuthErrorToMessage(error: unknown): MappedFirebaseAut
       return {
         providerDisabled: true,
         message:
-          'Email/Password authentication is not enabled in Firebase Console yet. Enable Email/Password under Authentication → Sign-in method, or click "Sign Up with Google" below.',
+          'This sign-in method is not enabled in Firebase Console yet. Enable Email/Password and Google under Authentication → Sign-in method.',
+      };
+    case 'auth/popup-closed-by-user':
+      return {
+        message: 'Google sign-in window was closed before completing sign-in. Please try again.',
+      };
+    case 'auth/cancelled-popup-request':
+      return {
+        message: 'Another Google sign-in window is already open. Please complete or close it and try again.',
+      };
+    case 'auth/popup-blocked':
+      return {
+        message:
+          'Your browser blocked the Google sign-in popup. Please allow popups for this site and try again.',
+      };
+    case 'auth/unauthorized-domain':
+      return {
+        message:
+          'This domain is not authorized for Google Sign-In yet. Add this domain under Firebase Console → Authentication → Settings → Authorized domains.',
+      };
+    case 'auth/account-exists-with-different-credential':
+      return {
+        message:
+          'An account already exists with this email using a different sign-in method. Please sign in with Email & Password.',
       };
     case 'auth/too-many-requests':
       return {
@@ -443,17 +630,12 @@ export function mapFirebaseAuthErrorToMessage(error: unknown): MappedFirebaseAut
         message:
           'Unable to reach Firebase right now. Please check your internet connection and try again.',
       };
-    case 'auth/popup-closed-by-user':
-    case 'auth/cancelled-popup-request':
-      return {
-        message: 'Google sign-in was cancelled before completing. Please try again.',
-      };
     default:
       if (/operation-not-allowed/i.test(rawMessage)) {
         return {
           providerDisabled: true,
           message:
-            'Email/Password sign-in is not enabled in Firebase Console yet. Enable it under Authentication → Sign-in method, or use Sign Up with Google.',
+            'This sign-in method is not enabled in Firebase Console yet. Enable Email/Password and Google under Authentication → Sign-in method.',
         };
       }
       return {

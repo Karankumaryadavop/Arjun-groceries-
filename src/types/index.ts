@@ -1009,6 +1009,35 @@ export interface StorageStatusSummary {
   conflictCount: number;
 }
 
+export type FirestoreSyncState =
+  | 'IDLE'
+  | 'SYNCING'
+  | 'SYNCED'
+  | 'NEEDS_VERIFICATION'
+  | 'ERROR';
+
+export interface FirestoreSyncedCounts {
+  customers: number;
+  customerTransactions: number;
+  suppliers: number;
+  supplierTransactions: number;
+  sales: number;
+  expenses: number;
+  cashbookEntries: number;
+  products: number;
+}
+
+export interface FirestoreSyncStatus {
+  enabled: boolean;
+  projectId: string;
+  state: FirestoreSyncState;
+  lastSyncedAt?: string | null;
+  lastPulledAt?: string | null;
+  lastError?: string | null;
+  permissionDenied?: boolean;
+  syncedCounts?: FirestoreSyncedCounts | null;
+}
+
 export interface StoreBusinessDataset {
   profile: StoreProfile;
   customers: Customer[];

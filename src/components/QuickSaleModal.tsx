@@ -48,6 +48,17 @@ import {
   SaleBillHeaderBar,
   SaleBillSubHeader,
 } from './SaleBillCard';
+import {
+  QuickSaleFieldErrors,
+  QuickSaleFieldName,
+  validateBillNotesField,
+  validateCartItems,
+  validateDirectAmountField,
+  validateLoyaltyPointsField,
+  validateQuickAddProductInput,
+  validateQuickAddQuantityField,
+  validateQuickSaleSubmission,
+} from '../utils/quickSaleValidation';
 
 const MAX_VISIBLE_CUSTOMER_RESULTS = 80;
 
@@ -88,7 +99,7 @@ export const QuickSaleModal: React.FC = () => {
   const [notes, setNotes] = useState<string>('');
   const [attachments, setAttachments] = useState<BillAttachment[]>([]);
   const [selectedProductToAdd, setSelectedProductToAdd] = useState<string>('');
-  const [addQty, setAddQty] = useState<number>(1);
+  const [addQty, setAddQty] = useState<string>('1');
   const [lastCompletedSaleId, setLastCompletedSaleId] = useState<string | null>(null);
   const [lastCompletedLoyalty, setLastCompletedLoyalty] = useState<{
     earned: number;
@@ -104,6 +115,7 @@ export const QuickSaleModal: React.FC = () => {
   const [isWhatsAppModalOpen, setIsWhatsAppModalOpen] = useState<boolean>(false);
   const [showExtrasSection, setShowExtrasSection] = useState<boolean>(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<QuickSaleFieldErrors>({});
   const [actionSuccessBanner, setActionSuccessBanner] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [isListeningVoice, setIsListeningVoice] = useState<boolean>(false);
@@ -261,17 +273,33 @@ export const QuickSaleModal: React.FC = () => {
         totalAmount: financials.grandTotal,
       };
 
+  const clearFieldError = (...fields: QuickSaleFieldName[]) => {
+    setFieldErrors((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const field of fields) {
+        if (next[field]) {
+          delete next[field];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  };
+
   const handleSelectCustomer = (customer: Customer) => {
     setSelectedCustomerId(customer.id);
     setLoyaltyPointsToRedeem('');
     setIsCustomerPickerOpen(false);
     setFormError(null);
+    clearFieldError('customer', 'loyaltyPoints');
   };
 
   const handleClearCustomer = () => {
     setSelectedCustomerId('');
     setLoyaltyPointsToRedeem('');
     setFormError(null);
+    clearFieldError('customer', 'loyaltyPoints');
   };
 
   const handleOpenCustomerPicker = () => {
@@ -285,6 +313,7 @@ export const QuickSaleModal: React.FC = () => {
   const handleSelectPaymentMethod = (method: PaymentMethod) => {
     setPaymentMethod(method);
     setFormError(null);
+    clearFieldError('customer');
     if (method === 'CREDIT' && !selectedCustomerId) {
       setIsCustomerPickerOpen(true);
       setTimeout(() => {
@@ -295,15 +324,27 @@ export const QuickSaleModal: React.FC = () => {
   };
 
   const handleAddProductToCart = () => {
-    if (!selectedProductToAdd) return;
     const prod = activeProducts.find((p) => p.id === selectedProductToAdd);
-    if (!prod) return;
-
-    const qty = Number(addQty);
-    if (!Number.isFinite(qty) || qty <= 0) {
-      setFormError('Quantity must be greater than zero.');
+    if (!prod) {
+      setFieldErrors((prev) => ({ ...prev, product: 'Please choose a product to add.' }));
+      setFormError('Please choose a product to add.');
       return;
     }
+
+    const addValidation = validateQuickAddProductInput({
+      productId: prod.id,
+      productName: prod.name,
+      unit: prod.unit,
+      quantityRaw: addQty,
+      rate: prod.sellingPrice,
+    });
+    if (!addValidation.success || !addValidation.data) {
+      setFieldErrors((prev) => ({ ...prev, ...addValidation.fieldErrors }));
+      setFormError(addValidation.error || 'Invalid product quantity or selling price.');
+      return;
+    }
+
+    const qty = addValidation.data.quantity;
 
     const existingSameUnitIndex = cartItems.findIndex(
       (item) =>
@@ -344,6 +385,13 @@ export const QuickSaleModal: React.FC = () => {
       nextCart = [...cartItems, newItem];
     }
 
+    const itemsValidation = validateCartItems(nextCart);
+    if (!itemsValidation.success) {
+      setFieldErrors((prev) => ({ ...prev, ...itemsValidation.fieldErrors }));
+      setFormError(itemsValidation.error || 'Invalid item entry.');
+      return;
+    }
+
     const stockCheck = validateSaleStock({
       items: nextCart,
       products,
@@ -356,26 +404,61 @@ export const QuickSaleModal: React.FC = () => {
 
     setCartItems(nextCart);
     setSelectedProductToAdd('');
-    setAddQty(1);
+    setAddQty('1');
     setDirectAmount('');
     setFormError(null);
+    clearFieldError('product', 'addQty', 'directAmount', 'items');
   };
 
   const handleRemoveCartItem = (index: number) => {
     setCartItems(cartItems.filter((_, i) => i !== index));
     setFormError(null);
+    clearFieldError('items');
   };
 
   const executeGenerateBill = () => {
     if (submitLockRef.current || isSubmitting || isFinalized) return;
 
-    if (grossTotal <= 0) {
-      setFormError('Please add at least one product or enter a valid direct bill amount.');
+    const validCustomer = customers.find((c) => c.id === selectedCustomerId);
+
+    const submissionValidation = validateQuickSaleSubmission({
+      paymentMethod,
+      customerId: validCustomer?.id,
+      items: cartItems,
+      directAmountRaw: directAmount,
+      grossAmount: grossTotal,
+      netAmount: finalTotal,
+      loyaltyPointsRaw: loyaltyPointsToRedeem,
+      maxRedeemablePoints: loyaltyRedemption.maxRedeemablePoints,
+      loyaltyEnabled: Boolean(selectedCustomer && selectedCustomerLoyalty && loyaltyConfig.enabled),
+      notes,
+    });
+
+    if (!submissionValidation.success) {
+      const nextFieldErrors: QuickSaleFieldErrors = { ...submissionValidation.fieldErrors };
+      if (addQty.trim() !== '') {
+        const qtyCheck = validateQuickAddQuantityField(addQty);
+        if (!qtyCheck.success && qtyCheck.fieldErrors.addQty) {
+          nextFieldErrors.addQty = qtyCheck.fieldErrors.addQty;
+        }
+      }
+      setFieldErrors(nextFieldErrors);
+      setFormError(
+        submissionValidation.error || 'Please correct the invalid sale details before saving.'
+      );
+      if (nextFieldErrors.customer) {
+        handleOpenCustomerPicker();
+      }
+      if (nextFieldErrors.notes) {
+        setShowExtrasSection(true);
+      }
       return;
     }
 
     if (requestedRedeemPoints > 0 && !loyaltyRedemption.valid) {
-      setFormError(loyaltyRedemption.error || 'Invalid loyalty point redemption amount.');
+      const loyaltyErr = loyaltyRedemption.error || 'Invalid loyalty point redemption amount.';
+      setFieldErrors((prev) => ({ ...prev, loyaltyPoints: loyaltyErr }));
+      setFormError(loyaltyErr);
       return;
     }
 
@@ -391,13 +474,7 @@ export const QuickSaleModal: React.FC = () => {
       }
     }
 
-    const validCustomer = customers.find((c) => c.id === selectedCustomerId);
-    if (paymentMethod === 'CREDIT' && !validCustomer) {
-      setFormError('Please select a customer for Credit (Udhar) sale.');
-      handleOpenCustomerPicker();
-      return;
-    }
-
+    setFieldErrors({});
     setFormError(null);
     submitLockRef.current = true;
     setIsSubmitting(true);
@@ -533,6 +610,8 @@ export const QuickSaleModal: React.FC = () => {
     stopVoiceSearch();
     setCartItems([]);
     setDirectAmount('');
+    setSelectedProductToAdd('');
+    setAddQty('1');
     setSelectedCustomerId('');
     setCustomerSearchQuery('');
     setIsCustomerPickerOpen(false);
@@ -546,6 +625,7 @@ export const QuickSaleModal: React.FC = () => {
     setIsWhatsAppModalOpen(false);
     setShowExtrasSection(false);
     setFormError(null);
+    setFieldErrors({});
     setActionSuccessBanner(null);
     setVoiceFeedback(null);
     setIsSubmitting(false);
@@ -733,44 +813,89 @@ export const QuickSaleModal: React.FC = () => {
                   </div>
 
                   {/* Quick single-item dropdown */}
-                  <div className="flex gap-2">
-                    <select
-                      aria-label="Quick Choose Product"
-                      value={selectedProductToAdd}
-                      onChange={(e) => setSelectedProductToAdd(e.target.value)}
-                      className="flex-1 min-w-0 text-xs border border-slate-300 dark:border-slate-700 rounded-xl px-2.5 py-2.5 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 focus:outline-emerald-600"
-                    >
-                      <option value="">-- Quick Add Product --</option>
-                      {activeProducts.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name} ({p.unit}) · {formatINR(p.sellingPrice)} (Stock: {p.stockQty})
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      type="number"
-                      min="0.1"
-                      step="any"
-                      aria-label="Quick Add Quantity"
-                      value={addQty}
-                      onChange={(e) => setAddQty(parseFloat(e.target.value) || 1)}
-                      className="w-16 text-center text-xs font-bold border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 rounded-xl p-2 tabular-nums"
-                    />
-                    <button
-                      type="button"
-                      data-testid="quick-add-product-btn"
-                      onClick={handleAddProductToCart}
-                      disabled={!selectedProductToAdd}
-                      className="px-3.5 py-2 min-h-[40px] bg-emerald-700 hover:bg-emerald-800 disabled:opacity-45 text-white rounded-xl text-xs font-bold cursor-pointer flex items-center gap-1 shrink-0"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>Add</span>
-                    </button>
+                  <div className="space-y-1.5">
+                    <div className="flex gap-2">
+                      <select
+                        aria-label="Quick Choose Product"
+                        aria-invalid={Boolean(fieldErrors.product)}
+                        value={selectedProductToAdd}
+                        onChange={(e) => {
+                          setSelectedProductToAdd(e.target.value);
+                          clearFieldError('product');
+                          if (formError) setFormError(null);
+                        }}
+                        className={`flex-1 min-w-0 text-xs border rounded-xl px-2.5 py-2.5 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 focus:outline-emerald-600 ${
+                          fieldErrors.product
+                            ? 'border-red-400 dark:border-red-700'
+                            : 'border-slate-300 dark:border-slate-700'
+                        }`}
+                      >
+                        <option value="">-- Quick Add Product --</option>
+                        {activeProducts.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name} ({p.unit}) · {formatINR(p.sellingPrice)} (Stock: {p.stockQty})
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        type="number"
+                        min="0.1"
+                        step="any"
+                        aria-label="Quick Add Quantity"
+                        aria-invalid={Boolean(fieldErrors.addQty)}
+                        value={addQty}
+                        onChange={(e) => {
+                          const nextVal = e.target.value;
+                          setAddQty(nextVal);
+                          if (formError) setFormError(null);
+                          if (nextVal.trim() === '') {
+                            clearFieldError('addQty');
+                          } else {
+                            const check = validateQuickAddQuantityField(nextVal);
+                            if (!check.success && check.fieldErrors.addQty) {
+                              setFieldErrors((prev) => ({
+                                ...prev,
+                                addQty: check.fieldErrors.addQty,
+                              }));
+                            } else {
+                              clearFieldError('addQty');
+                            }
+                          }
+                        }}
+                        className={`w-16 text-center text-xs font-bold border bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 rounded-xl p-2 tabular-nums ${
+                          fieldErrors.addQty
+                            ? 'border-red-400 dark:border-red-700 text-red-700 dark:text-red-300'
+                            : 'border-slate-300 dark:border-slate-700'
+                        }`}
+                      />
+                      <button
+                        type="button"
+                        data-testid="quick-add-product-btn"
+                        onClick={handleAddProductToCart}
+                        disabled={!selectedProductToAdd}
+                        className="px-3.5 py-2 min-h-[40px] bg-emerald-700 hover:bg-emerald-800 disabled:opacity-45 text-white rounded-xl text-xs font-bold cursor-pointer flex items-center gap-1 shrink-0"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>Add</span>
+                      </button>
+                    </div>
+                    {(fieldErrors.product || fieldErrors.addQty || fieldErrors.items) && (
+                      <p
+                        role="alert"
+                        data-testid="quick-add-field-error"
+                        className="text-[11px] font-semibold text-red-700 dark:text-red-300"
+                      >
+                        {fieldErrors.addQty || fieldErrors.product || fieldErrors.items}
+                      </p>
+                    )}
                   </div>
 
                   {/* Direct Counter Amount Fallback */}
                   <div>
-                    <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 mb-1">
+                    <label
+                      htmlFor="quick-sale-direct-amount"
+                      className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 mb-1"
+                    >
                       Or Enter Direct Counter Amount (₹)
                     </label>
                     <div className="relative">
@@ -778,10 +903,12 @@ export const QuickSaleModal: React.FC = () => {
                         ₹
                       </span>
                       <input
+                        id="quick-sale-direct-amount"
                         type="number"
                         min="1"
                         step="any"
                         aria-label="Direct Sale Amount"
+                        aria-invalid={Boolean(fieldErrors.directAmount)}
                         placeholder={
                           cartItems.length > 0
                             ? 'Calculated automatically from items'
@@ -789,13 +916,40 @@ export const QuickSaleModal: React.FC = () => {
                         }
                         value={cartItems.length > 0 ? cartTotal : directAmount}
                         onChange={(e) => {
-                          setDirectAmount(e.target.value);
+                          const nextVal = e.target.value;
+                          setDirectAmount(nextVal);
                           if (formError) setFormError(null);
+                          if (nextVal.trim() === '') {
+                            clearFieldError('directAmount');
+                          } else {
+                            const check = validateDirectAmountField(nextVal);
+                            if (!check.success && check.fieldErrors.directAmount) {
+                              setFieldErrors((prev) => ({
+                                ...prev,
+                                directAmount: check.fieldErrors.directAmount,
+                              }));
+                            } else {
+                              clearFieldError('directAmount');
+                            }
+                          }
                         }}
                         disabled={cartItems.length > 0}
-                        className="w-full text-sm font-bold pl-7 pr-3 py-2.5 border border-slate-300 dark:border-slate-700 rounded-xl bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 focus:outline-emerald-600 disabled:opacity-60 tabular-nums"
+                        className={`w-full text-sm font-bold pl-7 pr-3 py-2.5 border rounded-xl bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 focus:outline-emerald-600 disabled:opacity-60 tabular-nums ${
+                          fieldErrors.directAmount
+                            ? 'border-red-400 dark:border-red-700'
+                            : 'border-slate-300 dark:border-slate-700'
+                        }`}
                       />
                     </div>
+                    {fieldErrors.directAmount && cartItems.length === 0 && (
+                      <p
+                        role="alert"
+                        data-testid="direct-amount-field-error"
+                        className="mt-1 text-[11px] font-semibold text-red-700 dark:text-red-300"
+                      >
+                        {fieldErrors.directAmount}
+                      </p>
+                    )}
                   </div>
                 </div>
 
@@ -1028,19 +1182,38 @@ export const QuickSaleModal: React.FC = () => {
                             max={loyaltyRedemption.maxRedeemablePoints}
                             step="1"
                             aria-label="Redeem loyalty points"
+                            aria-invalid={Boolean(fieldErrors.loyaltyPoints || !loyaltyRedemption.valid)}
                             placeholder={`Redeem pts (max ${loyaltyRedemption.maxRedeemablePoints})`}
                             value={loyaltyPointsToRedeem}
                             onChange={(e) => {
-                              setLoyaltyPointsToRedeem(e.target.value);
+                              const nextVal = e.target.value;
+                              setLoyaltyPointsToRedeem(nextVal);
                               setFormError(null);
+                              const check = validateLoyaltyPointsField(
+                                nextVal,
+                                loyaltyRedemption.maxRedeemablePoints
+                              );
+                              if (!check.success && check.fieldErrors.loyaltyPoints) {
+                                setFieldErrors((prev) => ({
+                                  ...prev,
+                                  loyaltyPoints: check.fieldErrors.loyaltyPoints,
+                                }));
+                              } else {
+                                clearFieldError('loyaltyPoints');
+                              }
                             }}
-                            className="flex-1 text-xs font-bold p-2 rounded-xl border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 tabular-nums"
+                            className={`flex-1 text-xs font-bold p-2 rounded-xl border bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 tabular-nums ${
+                              fieldErrors.loyaltyPoints
+                                ? 'border-red-400 dark:border-red-700'
+                                : 'border-emerald-300 dark:border-emerald-700'
+                            }`}
                           />
                           <button
                             type="button"
-                            onClick={() =>
-                              setLoyaltyPointsToRedeem(String(loyaltyRedemption.maxRedeemablePoints))
-                            }
+                            onClick={() => {
+                              setLoyaltyPointsToRedeem(String(loyaltyRedemption.maxRedeemablePoints));
+                              clearFieldError('loyaltyPoints');
+                            }}
                             className="px-2.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-bold cursor-pointer whitespace-nowrap"
                           >
                             Use Max
@@ -1048,16 +1221,23 @@ export const QuickSaleModal: React.FC = () => {
                           {requestedRedeemPoints > 0 && (
                             <button
                               type="button"
-                              onClick={() => setLoyaltyPointsToRedeem('')}
+                              onClick={() => {
+                                setLoyaltyPointsToRedeem('');
+                                clearFieldError('loyaltyPoints');
+                              }}
                               className="px-2 py-2 rounded-xl bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-[11px] font-bold cursor-pointer"
                             >
                               Clear
                             </button>
                           )}
                         </div>
-                        {!loyaltyRedemption.valid && loyaltyRedemption.error && (
-                          <div className="text-[11px] font-semibold text-red-700 dark:text-red-300">
-                            {loyaltyRedemption.error}
+                        {(fieldErrors.loyaltyPoints || (!loyaltyRedemption.valid && loyaltyRedemption.error)) && (
+                          <div
+                            role="alert"
+                            data-testid="loyalty-points-field-error"
+                            className="text-[11px] font-semibold text-red-700 dark:text-red-300"
+                          >
+                            {fieldErrors.loyaltyPoints || loyaltyRedemption.error}
                           </div>
                         )}
                       </div>
@@ -1094,11 +1274,35 @@ export const QuickSaleModal: React.FC = () => {
                         </label>
                         <input
                           type="text"
+                          aria-label="Bill Note or Remark"
+                          aria-invalid={Boolean(fieldErrors.notes)}
                           value={notes}
-                          onChange={(e) => setNotes(e.target.value)}
+                          onChange={(e) => {
+                            const nextVal = e.target.value;
+                            setNotes(nextVal);
+                            const check = validateBillNotesField(nextVal);
+                            if (!check.success && check.fieldErrors.notes) {
+                              setFieldErrors((prev) => ({ ...prev, notes: check.fieldErrors.notes }));
+                            } else {
+                              clearFieldError('notes');
+                            }
+                          }}
                           placeholder="e.g. Monthly grocery pack, delivered home"
-                          className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 rounded-xl p-2.5 focus:outline-emerald-600"
+                          className={`w-full text-xs border bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 rounded-xl p-2.5 focus:outline-emerald-600 ${
+                            fieldErrors.notes
+                              ? 'border-red-400 dark:border-red-700'
+                              : 'border-slate-300 dark:border-slate-700'
+                          }`}
                         />
+                        {fieldErrors.notes && (
+                          <p
+                            role="alert"
+                            data-testid="notes-field-error"
+                            className="mt-1 text-[11px] font-semibold text-red-700 dark:text-red-300"
+                          >
+                            {fieldErrors.notes}
+                          </p>
+                        )}
                       </div>
 
                       <FileAttachment
@@ -1123,14 +1327,24 @@ export const QuickSaleModal: React.FC = () => {
                           }
                           if (data.notes) setNotes(data.notes);
                           if (data.items && data.items.length > 0) {
-                            const converted = data.items.map((it) => ({
+                            const converted: SaleItem[] = data.items.map((it) => ({
                               productName: it.name,
                               quantity: it.quantity,
                               unit: it.unit,
                               rate: it.rate,
                               total: it.total,
                             }));
-                            setCartItems(converted);
+                            const ocrValidation = validateCartItems(converted);
+                            if (!ocrValidation.success) {
+                              setFieldErrors((prev) => ({ ...prev, ...ocrValidation.fieldErrors }));
+                              setFormError(
+                                ocrValidation.error ||
+                                  'Some scanned items had invalid quantities or zero prices. Please review before billing.'
+                              );
+                            } else {
+                              clearFieldError('items', 'directAmount');
+                              setCartItems(converted);
+                            }
                           }
                         }}
                       />
@@ -1170,8 +1384,15 @@ export const QuickSaleModal: React.FC = () => {
             initialItems={cartItems}
             allowNegativeStock={Boolean(profile.allowNegativeStock)}
             onConfirmItems={(items) => {
+              const check = validateCartItems(items);
+              if (!check.success) {
+                setFieldErrors((prev) => ({ ...prev, ...check.fieldErrors }));
+                setFormError(check.error || 'One or more selected items have invalid quantity or price.');
+                return;
+              }
               setCartItems(items);
               setFormError(null);
+              clearFieldError('items', 'directAmount', 'product', 'addQty');
               if (items.length > 0) {
                 setDirectAmount('');
               }

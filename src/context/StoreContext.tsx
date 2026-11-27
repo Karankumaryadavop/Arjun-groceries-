@@ -41,6 +41,8 @@ import {
   DateFilterRange,
   ExpenseCategoryConfig,
   ExpenseRecord,
+  FirestoreSyncedCounts,
+  FirestoreSyncStatus,
   LocalBackupSnapshot,
   NavTab,
   PaymentMethod,
@@ -184,21 +186,33 @@ import {
   verifyPinHash,
 } from '../utils/securityCrypto';
 import {
+  FIREBASE_PROJECT_ID,
+  refreshFirebaseAuthUser,
   registerFirebaseEmailOwnerAccount,
+  resendFirebaseEmailVerification,
   sendFirebasePasswordResetEmail,
-  signInWithGoogleForCloudBackup,
-  signOutFirebaseSync,
-  storage as firebaseStorage,
+  signInWithFirebaseEmailPassword,
+  signInWithFirebaseGoogle,
+  signOutFirebaseAuth,
   subscribeToFirebaseAuth,
   testFirestoreConnection,
   waitForFirebaseAuthReady,
 } from '../firebase';
-import { ensureStoreWorkspaceDoc } from '../utils/firestoreSyncTransport';
 import {
+  ensureStoreWorkspaceDoc,
+  fetchDatasetFromFirestore,
+  parseFirestoreErrorInfo,
+  syncDatasetToFirestore,
+} from '../utils/firestoreSyncTransport';
+import {
+  EmailPasswordSignInInput,
+  EmailPasswordSignUpInput,
   mapFirebaseAuthErrorToMessage,
   maskEmailForNotice,
   resolvePasswordResetIdentifier,
   StoreRegistrationInput,
+  validateEmailPasswordSignInInput,
+  validateEmailPasswordSignUpInput,
   validateStoreRegistrationInput,
 } from '../utils/firebaseAuthFlows';
 import {
@@ -208,7 +222,7 @@ import {
 } from '../utils/cloudBackupCrypto';
 import {
   CloudBackupOwnerMismatchError,
-  createFirebaseCloudBackupTransport,
+  CloudBackupStorageTransport,
   DEFAULT_CLOUD_BACKUP_CONFIG,
   DEFAULT_CLOUD_BACKUP_STATUS,
   downloadAndInspectCloudBackup,
@@ -564,6 +578,29 @@ interface StoreContextType {
     pin: string;
     confirmPin: string;
   }) => Promise<{ success: boolean; error?: string }>;
+  signInWithEmailPassword: (params: EmailPasswordSignInInput) => Promise<{
+    success: boolean;
+    error?: string;
+    providerDisabled?: boolean;
+    cloudUserEmail?: string | null;
+  }>;
+  signInWithGoogle: (options?: {
+    storeName?: string;
+    ownerName?: string;
+  }) => Promise<{
+    success: boolean;
+    error?: string;
+    providerDisabled?: boolean;
+    cloudUserEmail?: string | null;
+  }>;
+  signUpWithEmailPassword: (params: EmailPasswordSignUpInput) => Promise<{
+    success: boolean;
+    error?: string;
+    verificationEmailSent?: boolean;
+    cloudUserEmail?: string | null;
+    providerDisabled?: boolean;
+    notice?: string;
+  }>;
   registerStoreOwnerWithFirebase: (params: StoreRegistrationInput) => Promise<{
     success: boolean;
     error?: string;
@@ -784,6 +821,26 @@ interface StoreContextType {
   updateAutoBackupSettings: (patch: Partial<AutoBackupSettings>) => Promise<void>;
   refreshStorageTelemetry: () => Promise<void>;
   purgeLegacyLocalStorageArchive: () => Promise<void>;
+
+  // Cloud Firestore Database Sync (arjun-groceries)
+  firestoreSyncStatus: FirestoreSyncStatus;
+  syncNowToFirestore: () => Promise<{
+    success: boolean;
+    error?: string;
+    permissionDenied?: boolean;
+    needsVerification?: boolean;
+    syncedCounts?: FirestoreSyncedCounts;
+  }>;
+  pullFromFirestore: () => Promise<{
+    success: boolean;
+    error?: string;
+    permissionDenied?: boolean;
+    needsVerification?: boolean;
+    emptyRemote?: boolean;
+    counts?: FirestoreSyncedCounts;
+  }>;
+  resendEmailVerification: () => Promise<{ success: boolean; error?: string }>;
+  refreshEmailVerificationStatus: () => Promise<{ verified: boolean; error?: string }>;
 
   // Phase 5: Encrypted Firebase Cloud Storage Backup & Disaster Recovery (LOCAL_ONLY primary)
   cloudAuthUser: CloudAuthUser | null;
@@ -1013,7 +1070,26 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   // Session-only memory ref: never write plaintext passphrase to localStorage or IndexedDB
   const cloudSessionPassphraseRef = useRef<string | null>(null);
   const cloudUploadInFlightRef = useRef<boolean>(false);
-  const cloudTransportRef = useRef(createFirebaseCloudBackupTransport(firebaseStorage));
+  const cloudTransportRef = useRef<CloudBackupStorageTransport>({
+    async uploadEncryptedObject() {
+      throw new Error(
+        'Cloud Storage backup is disabled — this app is configured to use Firebase Authentication only. Use Local File Backup instead.'
+      );
+    },
+    async listObjects() {
+      return [];
+    },
+    async downloadObjectBytes() {
+      throw new Error(
+        'Cloud Storage restore is disabled — this app is configured to use Firebase Authentication only. Use Local File Backup instead.'
+      );
+    },
+    async deleteObject() {
+      throw new Error(
+        'Cloud Storage management is disabled — this app is configured to use Firebase Authentication only.'
+      );
+    },
+  });
   const [storageStatus, setStorageStatus] = useState<StorageStatusSummary>({
     storageMode: 'LOCAL_ONLY',
     isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -1036,6 +1112,19 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const clearStorageError = useCallback(() => {
     setStorageStatus((prev) => ({ ...prev, storageError: null }));
   }, []);
+
+  const [firestoreSyncStatus, setFirestoreSyncStatus] = useState<FirestoreSyncStatus>({
+    enabled: true,
+    projectId: FIREBASE_PROJECT_ID,
+    state: 'IDLE',
+    lastSyncedAt: null,
+    lastPulledAt: null,
+    lastError: null,
+    permissionDenied: false,
+    syncedCounts: null,
+  });
+  const firestoreSyncInFlightRef = useRef(false);
+  const lastFirestoreSyncSignatureRef = useRef<string>('');
 
   const currentDatasetSnapshot = useMemo<StoreBusinessDataset>(
     () => ({
@@ -1115,7 +1204,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     setStorageStatus((prev) => ({
       ...prev,
-      storageMode: 'LOCAL_ONLY',
+      storageMode: 'CLOUD_SYNC_ENABLED',
+      cloudSyncConfigured: true,
+      firebaseProjectId: FIREBASE_PROJECT_ID,
       isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
       isPersistedStorage: quotaInfo.isPersisted,
       usageBytes: quotaInfo.usageBytes,
@@ -1188,6 +1279,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const persistNewAuthSession = useCallback(
     async (params: {
       authMode: StoreAuthMode;
+      email?: string;
+      firebaseUid?: string;
       mobile?: string;
       portalEntityId?: string;
       portalEntityName?: string;
@@ -1197,6 +1290,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         params.pinRecordOverride !== undefined ? params.pinRecordOverride : pinSecurityRef.current;
       const { record, key } = await createSignedAuthSession({
         authMode: params.authMode,
+        email: params.email,
+        firebaseUid: params.firebaseUid,
         mobile: params.mobile,
         portalEntityId: params.portalEntityId,
         portalEntityName: params.portalEntityName,
@@ -1516,15 +1611,34 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // Ensure offline / slow network environments never block startup initialization indefinitely
     const offlineFallbackTimer = setTimeout(forceMarkFirebaseReady, 2500);
 
+    // Validate Cloud Firestore connectivity on startup
+    void testFirestoreConnection();
+
     const unsubscribe = subscribeToFirebaseAuth(
       (user) => {
         if (!active) return;
         setCloudAuthUser(user);
         setStorageStatus((prev) => ({
           ...prev,
-          cloudSyncConfigured: Boolean(user?.emailVerified),
+          storageMode: 'CLOUD_SYNC_ENABLED',
+          cloudSyncConfigured: true,
+          firebaseProjectId: FIREBASE_PROJECT_ID,
           cloudUserEmail: user?.email ?? null,
         }));
+        if (user && !user.emailVerified) {
+          setFirestoreSyncStatus((prev) => ({
+            ...prev,
+            state: 'NEEDS_VERIFICATION',
+            lastError: null,
+          }));
+        } else if (!user) {
+          setFirestoreSyncStatus((prev) => ({
+            ...prev,
+            state: 'IDLE',
+            lastError: null,
+            permissionDenied: false,
+          }));
+        }
         listenerFired = true;
         tryMarkFirebaseReady();
       },
@@ -1540,8 +1654,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
     );
 
-    void testFirestoreConnection();
-
     waitForFirebaseAuthReady()
       .then((restoredUser) => {
         if (!active) return;
@@ -1549,9 +1661,17 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           setCloudAuthUser(restoredUser);
           setStorageStatus((prev) => ({
             ...prev,
-            cloudSyncConfigured: Boolean(restoredUser.emailVerified),
+            storageMode: 'CLOUD_SYNC_ENABLED',
+            cloudSyncConfigured: true,
+            firebaseProjectId: FIREBASE_PROJECT_ID,
             cloudUserEmail: restoredUser.email ?? null,
           }));
+          if (!restoredUser.emailVerified) {
+            setFirestoreSyncStatus((prev) => ({
+              ...prev,
+              state: 'NEEDS_VERIFICATION',
+            }));
+          }
         }
         authReadySettled = true;
         tryMarkFirebaseReady();
@@ -1561,7 +1681,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setCloudBackupStatus((prev) => ({
           ...prev,
           state: 'ERROR',
-          lastError: err instanceof Error ? err.message : 'Google sign-in session check failed.',
+          lastError: err instanceof Error ? err.message : 'Firebase Auth session check failed.',
         }));
         authReadySettled = true;
         tryMarkFirebaseReady();
@@ -1710,6 +1830,308 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     return () => clearInterval(timer);
   }, [isDbHydrated, autoBackupSettings, refreshStorageTelemetry]);
+
+  const syncNowToFirestore = useCallback(async (): Promise<{
+    success: boolean;
+    error?: string;
+    permissionDenied?: boolean;
+    needsVerification?: boolean;
+    syncedCounts?: FirestoreSyncedCounts;
+  }> => {
+    if (!cloudAuthUser?.uid) {
+      return {
+        success: false,
+        error: 'Please sign in with Email or Google to sync your store with Cloud Firestore.',
+      };
+    }
+    if (!cloudAuthUser.emailVerified) {
+      setFirestoreSyncStatus((prev) => ({
+        ...prev,
+        state: 'NEEDS_VERIFICATION',
+        lastError:
+          'Please verify your email address (check your inbox) to enable Cloud Firestore sync.',
+        permissionDenied: false,
+      }));
+      return {
+        success: false,
+        needsVerification: true,
+        error: 'Email verification is required before syncing with Cloud Firestore.',
+      };
+    }
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      return {
+        success: false,
+        error: 'Device is offline. Your changes are safely saved locally and will sync when online.',
+      };
+    }
+    if (firestoreSyncInFlightRef.current) {
+      return { success: false, error: 'A Firestore sync is already in progress.' };
+    }
+
+    firestoreSyncInFlightRef.current = true;
+    setFirestoreSyncStatus((prev) => ({
+      ...prev,
+      state: 'SYNCING',
+      lastError: null,
+      permissionDenied: false,
+    }));
+
+    try {
+      const snapshot = latestDatasetRef.current;
+      const result = await syncDatasetToFirestore(cloudAuthUser.uid, snapshot);
+      lastFirestoreSyncSignatureRef.current = JSON.stringify({
+        p: snapshot.profile.storeName,
+        o: snapshot.profile.ownerName,
+        c: snapshot.customers.length,
+        ct: snapshot.customerTransactions.length,
+        s: snapshot.suppliers.length,
+        st: snapshot.supplierTransactions.length,
+        sa: snapshot.sales.length,
+        e: snapshot.expenses.length,
+        cb: snapshot.cashbookEntries.length,
+        pr: snapshot.products.length,
+      });
+      setFirestoreSyncStatus({
+        enabled: true,
+        projectId: FIREBASE_PROJECT_ID,
+        state: 'SYNCED',
+        lastSyncedAt: result.syncedAt,
+        lastPulledAt: firestoreSyncStatus.lastPulledAt ?? null,
+        lastError: null,
+        permissionDenied: false,
+        syncedCounts: result.syncedCounts,
+      });
+      setStorageStatus((prev) => ({
+        ...prev,
+        storageMode: 'CLOUD_SYNC_ENABLED',
+        cloudSyncConfigured: true,
+        lastSyncAt: result.syncedAt,
+      }));
+      return {
+        success: true,
+        syncedCounts: result.syncedCounts,
+      };
+    } catch (err) {
+      const parsed = parseFirestoreErrorInfo(err);
+      setFirestoreSyncStatus((prev) => ({
+        ...prev,
+        state: 'ERROR',
+        lastError: parsed.message,
+        permissionDenied: parsed.permissionDenied,
+      }));
+      return {
+        success: false,
+        error: parsed.message,
+        permissionDenied: parsed.permissionDenied,
+      };
+    } finally {
+      firestoreSyncInFlightRef.current = false;
+    }
+  }, [cloudAuthUser, firestoreSyncStatus.lastPulledAt]);
+
+  const pullFromFirestore = useCallback(async (): Promise<{
+    success: boolean;
+    error?: string;
+    permissionDenied?: boolean;
+    needsVerification?: boolean;
+    emptyRemote?: boolean;
+    counts?: FirestoreSyncedCounts;
+  }> => {
+    if (!cloudAuthUser?.uid) {
+      return {
+        success: false,
+        error: 'Please sign in with Email or Google to pull data from Cloud Firestore.',
+      };
+    }
+    if (!cloudAuthUser.emailVerified) {
+      setFirestoreSyncStatus((prev) => ({
+        ...prev,
+        state: 'NEEDS_VERIFICATION',
+        lastError: 'Please verify your email address before pulling from Cloud Firestore.',
+      }));
+      return {
+        success: false,
+        needsVerification: true,
+        error: 'Email verification is required before reading from Cloud Firestore.',
+      };
+    }
+    if (firestoreSyncInFlightRef.current) {
+      return { success: false, error: 'A Firestore operation is already in progress.' };
+    }
+
+    firestoreSyncInFlightRef.current = true;
+    setFirestoreSyncStatus((prev) => ({
+      ...prev,
+      state: 'SYNCING',
+      lastError: null,
+      permissionDenied: false,
+    }));
+
+    try {
+      const pulled = await fetchDatasetFromFirestore(cloudAuthUser.uid);
+      if (!pulled) {
+        setFirestoreSyncStatus((prev) => ({
+          ...prev,
+          state: 'IDLE',
+          lastError: null,
+        }));
+        return {
+          success: true,
+          emptyRemote: true,
+        };
+      }
+
+      // Preserve a safety recovery checkpoint in local IndexedDB before applying remote records
+      if (dbRef.current) {
+        try {
+          await createLocalBackupSnapshot(
+            dbRef.current,
+            latestDatasetRef.current,
+            'PRE_RESTORE',
+            'Safety checkpoint before pulling Cloud Firestore data',
+            autoBackupSettings
+          );
+        } catch {
+          // Non-blocking safety checkpoint
+        }
+      }
+
+      setProfile((prev) => sanitizeProfileForStorage({ ...prev, ...pulled.profilePatch }));
+      if (pulled.lastClosedDate !== undefined) {
+        setLastClosedDate(pulled.lastClosedDate);
+      }
+      setCustomers(pulled.customers);
+      setCustomerTransactions(pulled.customerTransactions);
+      setSuppliers(pulled.suppliers);
+      setSupplierTransactions(pulled.supplierTransactions);
+      setSales(pulled.sales);
+      setExpenses(pulled.expenses);
+      setCashbookEntries(pulled.cashbookEntries);
+      setProducts(pulled.products);
+
+      const counts: FirestoreSyncedCounts = {
+        customers: pulled.customers.length,
+        customerTransactions: pulled.customerTransactions.length,
+        suppliers: pulled.suppliers.length,
+        supplierTransactions: pulled.supplierTransactions.length,
+        sales: pulled.sales.length,
+        expenses: pulled.expenses.length,
+        cashbookEntries: pulled.cashbookEntries.length,
+        products: pulled.products.length,
+      };
+      const pulledAt = new Date().toISOString();
+      setFirestoreSyncStatus((prev) => ({
+        ...prev,
+        state: 'SYNCED',
+        lastPulledAt: pulledAt,
+        lastError: null,
+        permissionDenied: false,
+        syncedCounts: counts,
+      }));
+      return { success: true, counts };
+    } catch (err) {
+      const parsed = parseFirestoreErrorInfo(err);
+      setFirestoreSyncStatus((prev) => ({
+        ...prev,
+        state: 'ERROR',
+        lastError: parsed.message,
+        permissionDenied: parsed.permissionDenied,
+      }));
+      return {
+        success: false,
+        error: parsed.message,
+        permissionDenied: parsed.permissionDenied,
+      };
+    } finally {
+      firestoreSyncInFlightRef.current = false;
+    }
+  }, [cloudAuthUser, autoBackupSettings]);
+
+  const resendEmailVerification = useCallback(async (): Promise<{
+    success: boolean;
+    error?: string;
+  }> => {
+    try {
+      await resendFirebaseEmailVerification();
+      return { success: true };
+    } catch (err) {
+      return {
+        success: false,
+        error: mapFirebaseAuthErrorToMessage(err).message,
+      };
+    }
+  }, []);
+
+  const refreshEmailVerificationStatus = useCallback(async (): Promise<{
+    verified: boolean;
+    error?: string;
+  }> => {
+    try {
+      const refreshed = await refreshFirebaseAuthUser();
+      setCloudAuthUser(refreshed);
+      if (refreshed?.emailVerified) {
+        setFirestoreSyncStatus((prev) => ({
+          ...prev,
+          state: 'IDLE',
+          lastError: null,
+          permissionDenied: false,
+        }));
+        return { verified: true };
+      }
+      return { verified: false };
+    } catch (err) {
+      return {
+        verified: false,
+        error: mapFirebaseAuthErrorToMessage(err).message,
+      };
+    }
+  }, []);
+
+  // Debounced automatic Cloud Firestore sync for verified signed-in owners
+  useEffect(() => {
+    if (
+      !isDbHydrated ||
+      !isAuthenticated ||
+      !cloudAuthUser?.uid ||
+      !cloudAuthUser.emailVerified ||
+      !storageStatus.isOnline ||
+      firestoreSyncStatus.state === 'ERROR'
+    ) {
+      return;
+    }
+
+    const sig = JSON.stringify({
+      p: currentDatasetSnapshot.profile.storeName,
+      o: currentDatasetSnapshot.profile.ownerName,
+      c: currentDatasetSnapshot.customers.length,
+      ct: currentDatasetSnapshot.customerTransactions.length,
+      s: currentDatasetSnapshot.suppliers.length,
+      st: currentDatasetSnapshot.supplierTransactions.length,
+      sa: currentDatasetSnapshot.sales.length,
+      e: currentDatasetSnapshot.expenses.length,
+      cb: currentDatasetSnapshot.cashbookEntries.length,
+      pr: currentDatasetSnapshot.products.length,
+    });
+    if (sig === lastFirestoreSyncSignatureRef.current && firestoreSyncStatus.lastSyncedAt) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      void syncNowToFirestore();
+    }, 3000);
+
+    return () => clearTimeout(timer);
+  }, [
+    isDbHydrated,
+    isAuthenticated,
+    cloudAuthUser?.uid,
+    cloudAuthUser?.emailVerified,
+    storageStatus.isOnline,
+    currentDatasetSnapshot,
+    firestoreSyncStatus.state,
+    firestoreSyncStatus.lastSyncedAt,
+    syncNowToFirestore,
+  ]);
 
   // Append Audit Log Helper
   const logAudit = (action: string, details: string, entityType: AuditLog['entityType'], entityId?: string) => {
@@ -2126,6 +2548,260 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
+  const signInWithEmailPassword = async (
+    params: EmailPasswordSignInInput
+  ): Promise<{
+    success: boolean;
+    error?: string;
+    providerDisabled?: boolean;
+    cloudUserEmail?: string | null;
+  }> => {
+    const validation = validateEmailPasswordSignInInput(params);
+    if (!validation.valid || !validation.data) {
+      return {
+        success: false,
+        error: validation.error || 'Please enter a valid email and password.',
+      };
+    }
+
+    const v = validation.data;
+    try {
+      const firebaseUser = await signInWithFirebaseEmailPassword({
+        email: v.email,
+        password: v.password,
+      });
+
+      const resolvedEmail = firebaseUser.email || v.email;
+      const nextCloudConfig: CloudBackupConfig = {
+        ...cloudBackupConfig,
+        boundOwnerUid: firebaseUser.uid,
+        boundOwnerEmail: resolvedEmail,
+      };
+
+      setCloudAuthUser(firebaseUser);
+      setCloudBackupConfig(nextCloudConfig);
+      setStorageStatus((prev) => ({
+        ...prev,
+        storageMode: 'CLOUD_SYNC_ENABLED',
+        cloudSyncConfigured: true,
+        firebaseProjectId: FIREBASE_PROJECT_ID,
+        cloudUserEmail: resolvedEmail,
+      }));
+
+      if (firebaseUser.emailVerified) {
+        void ensureStoreWorkspaceDoc(firebaseUser.uid, profile, lastClosedDate).catch(() => undefined);
+      }
+
+      if (dbRef.current) {
+        await dbRef.current.setMeta('cloudBackupConfig', nextCloudConfig);
+      }
+
+      await persistNewAuthSession({
+        authMode: 'FIREBASE_EMAIL',
+        email: resolvedEmail,
+        firebaseUid: firebaseUser.uid,
+        mobile: profile.phone,
+      });
+
+      logAudit(
+        'STORE_LOGIN_FIREBASE_EMAIL',
+        `Signed in via Firebase Email/Password (${resolvedEmail})`,
+        'SETTINGS'
+      );
+
+      return {
+        success: true,
+        cloudUserEmail: resolvedEmail,
+      };
+    } catch (err) {
+      const mapped = mapFirebaseAuthErrorToMessage(err);
+      return {
+        success: false,
+        error: mapped.message,
+        providerDisabled: mapped.providerDisabled,
+      };
+    }
+  };
+
+  const signInWithGoogle = async (options?: {
+    storeName?: string;
+    ownerName?: string;
+  }): Promise<{
+    success: boolean;
+    error?: string;
+    providerDisabled?: boolean;
+    cloudUserEmail?: string | null;
+  }> => {
+    try {
+      const firebaseUser = await signInWithFirebaseGoogle();
+      const resolvedEmail = firebaseUser.email || undefined;
+      const candidateStoreName = options?.storeName?.trim();
+      const candidateOwnerName =
+        options?.ownerName?.trim() || firebaseUser.displayName?.trim() || '';
+
+      const nextProfile = sanitizeProfileForStorage({
+        ...profile,
+        ...(candidateStoreName && candidateStoreName.length >= 2
+          ? { storeName: candidateStoreName }
+          : {}),
+        ...(candidateOwnerName &&
+        (!profile.ownerName ||
+          profile.ownerName.trim() === '' ||
+          profile.ownerName.trim().toLowerCase() === 'store owner' ||
+          Boolean(options?.ownerName?.trim()))
+          ? { ownerName: candidateOwnerName }
+          : {}),
+      });
+
+      const nextCloudConfig: CloudBackupConfig = {
+        ...cloudBackupConfig,
+        boundOwnerUid: firebaseUser.uid,
+        boundOwnerEmail: resolvedEmail ?? cloudBackupConfig.boundOwnerEmail,
+      };
+
+      setCloudAuthUser(firebaseUser);
+      setCloudBackupConfig(nextCloudConfig);
+      setProfile(nextProfile);
+      setNeedsFirstTimeSetup(false);
+      setStorageStatus((prev) => ({
+        ...prev,
+        storageMode: 'CLOUD_SYNC_ENABLED',
+        cloudSyncConfigured: true,
+        firebaseProjectId: FIREBASE_PROJECT_ID,
+        cloudUserEmail: resolvedEmail ?? null,
+      }));
+
+      if (firebaseUser.emailVerified) {
+        void ensureStoreWorkspaceDoc(firebaseUser.uid, nextProfile, lastClosedDate).catch(() => undefined);
+      }
+
+      if (dbRef.current) {
+        await dbRef.current.setMeta('firstTimeSetupCompleted', true);
+        await dbRef.current.setMeta('cloudBackupConfig', nextCloudConfig);
+      }
+
+      await persistNewAuthSession({
+        authMode: 'FIREBASE_GOOGLE',
+        email: resolvedEmail,
+        firebaseUid: firebaseUser.uid,
+        mobile: nextProfile.phone,
+      });
+
+      logAudit(
+        'STORE_LOGIN_FIREBASE_GOOGLE',
+        `Signed in via Firebase Google Authentication (${resolvedEmail || firebaseUser.uid})`,
+        'SETTINGS'
+      );
+
+      return {
+        success: true,
+        cloudUserEmail: resolvedEmail ?? null,
+      };
+    } catch (err) {
+      const mapped = mapFirebaseAuthErrorToMessage(err);
+      return {
+        success: false,
+        error: mapped.message,
+        providerDisabled: mapped.providerDisabled,
+      };
+    }
+  };
+
+  const signUpWithEmailPassword = async (
+    params: EmailPasswordSignUpInput
+  ): Promise<{
+    success: boolean;
+    error?: string;
+    verificationEmailSent?: boolean;
+    cloudUserEmail?: string | null;
+    providerDisabled?: boolean;
+    notice?: string;
+  }> => {
+    const validation = validateEmailPasswordSignUpInput(params);
+    if (!validation.valid || !validation.data) {
+      return {
+        success: false,
+        error: validation.error || 'Please check all registration details.',
+      };
+    }
+
+    const v = validation.data;
+    try {
+      const { user: firebaseUser, verificationEmailSent } =
+        await registerFirebaseEmailOwnerAccount({
+          email: v.email,
+          password: v.password,
+          displayName: v.ownerName,
+        });
+
+      const nextProfile = sanitizeProfileForStorage({
+        ...profile,
+        storeName: v.storeName,
+        ownerName: v.ownerName,
+        phone: v.normalizedMobile || profile.phone,
+        address: v.address || profile.address,
+        upiId: v.upiId || profile.upiId,
+        gstin: v.gstin || profile.gstin,
+      });
+
+      const nextCloudConfig: CloudBackupConfig = {
+        ...cloudBackupConfig,
+        boundOwnerUid: firebaseUser.uid,
+        boundOwnerEmail: firebaseUser.email || v.email,
+      };
+
+      setCloudAuthUser(firebaseUser);
+      setCloudBackupConfig(nextCloudConfig);
+      setProfile(nextProfile);
+      setNeedsFirstTimeSetup(false);
+      setStorageStatus((prev) => ({
+        ...prev,
+        storageMode: 'CLOUD_SYNC_ENABLED',
+        cloudSyncConfigured: true,
+        firebaseProjectId: FIREBASE_PROJECT_ID,
+        cloudUserEmail: firebaseUser.email ?? v.email,
+      }));
+
+      if (firebaseUser.emailVerified) {
+        void ensureStoreWorkspaceDoc(firebaseUser.uid, nextProfile, lastClosedDate).catch(() => undefined);
+      }
+
+      if (dbRef.current) {
+        await dbRef.current.setMeta('firstTimeSetupCompleted', true);
+        await dbRef.current.setMeta('cloudBackupConfig', nextCloudConfig);
+      }
+
+      await persistNewAuthSession({
+        authMode: 'FIREBASE_EMAIL',
+        email: firebaseUser.email || v.email,
+        firebaseUid: firebaseUser.uid,
+        mobile: nextProfile.phone,
+      });
+
+      logAudit(
+        'ACCOUNT_REGISTERED_FIREBASE',
+        `Signed up store "${v.storeName}" (${v.ownerName}) with Firebase Email/Password`,
+        'SETTINGS'
+      );
+
+      return {
+        success: true,
+        verificationEmailSent,
+        cloudUserEmail: firebaseUser.email ?? v.email,
+        notice: verificationEmailSent
+          ? 'Account created with Firebase Authentication. A verification email has been sent.'
+          : 'Account created with Firebase Authentication.',
+      };
+    } catch (err) {
+      const mapped = mapFirebaseAuthErrorToMessage(err);
+      return {
+        success: false,
+        error: mapped.message,
+        providerDisabled: mapped.providerDisabled,
+      };
+    }
+  };
+
   const registerStoreOwnerWithFirebase = async (
     params: StoreRegistrationInput
   ): Promise<{
@@ -2137,6 +2813,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     providerDisabled?: boolean;
     notice?: string;
   }> => {
+    if (params.authMethod === 'GOOGLE') {
+      return {
+        success: false,
+        error: 'Only Email & Password authentication is enabled for this app.',
+      };
+    }
     const validation = validateStoreRegistrationInput(params);
     if (!validation.valid || !validation.data) {
       return {
@@ -2146,42 +2828,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
 
     const v = validation.data;
+    if (!v.email || !v.password) {
+      return {
+        success: false,
+        error: 'Email address and password are required for email sign-up.',
+      };
+    }
+
     try {
-      let firebaseUser: CloudAuthUser | null = null;
-      let verificationEmailSent = false;
-
-      if (v.authMethod === 'GOOGLE') {
-        const res = await signInWithGoogleForCloudBackup();
-        if (res.redirectStarted) {
-          return {
-            success: false,
-            error:
-              'Google sign-in opened in redirect mode. Complete Google sign-in and finish store setup.',
-          };
-        }
-        firebaseUser = res.user;
-      } else {
-        if (!v.email || !v.password) {
-          return {
-            success: false,
-            error: 'Email address and password are required for email sign-up.',
-          };
-        }
-        const reg = await registerFirebaseEmailOwnerAccount({
-          email: v.email,
-          password: v.password,
-          displayName: v.ownerName,
-        });
-        firebaseUser = reg.user;
-        verificationEmailSent = reg.verificationEmailSent;
-      }
-
-      if (!firebaseUser) {
-        return {
-          success: false,
-          error: 'Could not authenticate with Firebase. Please try again.',
-        };
-      }
+      const reg = await registerFirebaseEmailOwnerAccount({
+        email: v.email,
+        password: v.password,
+        displayName: v.ownerName,
+      });
+      const firebaseUser = reg.user;
 
       const hashed = await hashPinWithSalt(v.normalizedPin);
       pinSecurityRef.current = hashed;
@@ -2206,21 +2866,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         boundOwnerEmail: firebaseUser.email || v.email || cloudBackupConfig.boundOwnerEmail || null,
       };
 
-      let firestoreInitialized = false;
-      if (firebaseUser.emailVerified) {
-        await ensureStoreWorkspaceDoc(firebaseUser.uid, nextProfile, lastClosedDate);
-        firestoreInitialized = true;
-      }
-
       setCloudAuthUser(firebaseUser);
       setCloudBackupConfig(nextCloudConfig);
       setProfile(nextProfile);
       setNeedsFirstTimeSetup(false);
       setStorageStatus((prev) => ({
         ...prev,
-        storageMode: 'CLOUD_SYNC_ENABLED',
-        cloudSyncConfigured: Boolean(firebaseUser?.emailVerified),
-        cloudUserEmail: firebaseUser?.email ?? v.email ?? null,
+        cloudSyncConfigured: false,
+        cloudUserEmail: firebaseUser.email ?? v.email ?? null,
       }));
 
       if (dbRef.current) {
@@ -2230,27 +2883,25 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
 
       await persistNewAuthSession({
-        authMode: 'PIN',
+        authMode: 'FIREBASE_EMAIL',
+        email: firebaseUser.email || v.email,
+        firebaseUid: firebaseUser.uid,
         mobile: v.normalizedMobile,
         pinRecordOverride: hashed,
       });
 
       logAudit(
         'ACCOUNT_REGISTERED_FIREBASE',
-        `Registered store "${v.storeName}" (${v.ownerName}) with Firebase Auth${
-          firestoreInitialized ? ' and initialized Firestore store document' : ' (pending email verification for Firestore sync)'
-        }`,
+        `Registered store "${v.storeName}" (${v.ownerName}) with Firebase Email/Password`,
         'SETTINGS'
       );
 
       return {
         success: true,
-        firestoreInitialized,
-        verificationEmailSent,
+        firestoreInitialized: false,
+        verificationEmailSent: reg.verificationEmailSent,
         cloudUserEmail: firebaseUser.email ?? v.email ?? null,
-        notice: firestoreInitialized
-          ? 'Store account created and Firestore workspace initialized.'
-          : 'Firebase account created and verification email sent. Verify your email to activate Firestore cloud sync.',
+        notice: 'Account created with Firebase Email/Password authentication.',
       };
     } catch (err) {
       const mapped = mapFirebaseAuthErrorToMessage(err);
@@ -2367,67 +3018,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
-  const recoverOwnerWithGoogle = async (params: {
+  const recoverOwnerWithGoogle = async (_params: {
     newPin: string;
     confirmNewPin: string;
   }): Promise<{ success: boolean; error?: string }> => {
-    const trimmed = params.newPin.trim();
-    if (!/^\d{4}$/.test(trimmed)) {
-      return { success: false, error: 'Please choose a new 4-digit numeric PIN.' };
-    }
-    if (trimmed !== params.confirmNewPin.trim()) {
-      return { success: false, error: 'New PIN and Confirm PIN do not match.' };
-    }
-
-    try {
-      const { user, redirectStarted } = await signInWithGoogleForCloudBackup();
-      if (redirectStarted) {
-        return {
-          success: false,
-          error: 'Google sign-in opened in redirect mode. Complete Google verification and retry.',
-        };
-      }
-      if (!user || !user.emailVerified) {
-        return {
-          success: false,
-          error: 'A verified Google account is required to reset your store PIN.',
-        };
-      }
-      if (cloudBackupConfig.boundOwnerUid && cloudBackupConfig.boundOwnerUid !== user.uid) {
-        return {
-          success: false,
-          error: `Please sign in with the linked store Google account (${cloudBackupConfig.boundOwnerEmail || 'linked owner email'}).`,
-        };
-      }
-
-      setCloudAuthUser(user);
-      const hashed = await hashPinWithSalt(trimmed);
-      pinSecurityRef.current = hashed;
-      setHasPinConfigured(true);
-      setNeedsPinSetup(false);
-      setIsLocked(false);
-      clearPinAttemptState();
-
-      if (dbRef.current) {
-        await dbRef.current.setMeta('pinSecurity', hashed);
-      }
-
-      await persistNewAuthSession({
-        authMode: 'PIN',
-        mobile: profile.phone,
-        pinRecordOverride: hashed,
-      });
-      logAudit(
-        'OWNER_PIN_RECOVERED_GOOGLE',
-        `Reset store security PIN via verified Google account (${user.email || user.uid})`,
-        'SETTINGS'
-      );
-      return { success: true };
-    } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : 'Google account verification failed. Please try again.';
-      return { success: false, error: msg };
-    }
+    return {
+      success: false,
+      error: 'Google sign-in is disabled. Use Email & Password or Forgot Password reset email instead.',
+    };
   };
 
   const loginAsCustomer = async (params: {
@@ -2487,13 +3085,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const logout = async (): Promise<void> => {
+    await signOutFirebaseAuth().catch(() => undefined);
     await revokePersistedAuthSession();
+    setCloudAuthUser(null);
     setIsLocked(Boolean(profile.isPinEnabled));
     setAuthNotice({
       type: 'logged_out',
-      message: 'You have been logged out safely.',
+      message: 'You have been signed out safely.',
     });
-    logAudit('STORE_LOGOUT', 'Explicitly logged out and revoked persisted store session', 'SETTINGS');
+    logAudit('STORE_LOGOUT', 'Explicitly signed out of Firebase Auth and revoked local session', 'SETTINGS');
   };
 
   const verifyPin = async (pin: string): Promise<boolean> => {
@@ -4960,35 +5560,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     error?: string;
     redirectStarted?: boolean;
   }> => {
-    try {
-      const res = await signInWithGoogleForCloudBackup();
-      if (res.redirectStarted) {
-        return { success: true, redirectStarted: true };
-      }
-      if (res.user) {
-        setCloudAuthUser(res.user);
-        if (!cloudBackupConfig.boundOwnerUid) {
-          await persistCloudConfig({
-            ...cloudBackupConfig,
-            boundOwnerUid: res.user.uid,
-            boundOwnerEmail: res.user.email,
-          });
-        }
-        const entries = await listUserCloudBackups(cloudTransportRef.current, res.user.uid).catch(
-          () => [] as CloudBackupRemoteEntry[]
-        );
-        setCloudBackupHistory(entries);
-      }
-      return { success: true };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Google sign-in failed.';
-      await persistCloudStatus({ ...cloudBackupStatus, state: 'ERROR', lastError: msg });
-      return { success: false, error: msg };
-    }
+    return {
+      success: false,
+      error:
+        'Cloud Storage backup is disabled — this app uses Firebase Email & Password Authentication only. Use Local File Backup instead.',
+    };
   };
 
   const signOutCloudBackupAccount = async (): Promise<void> => {
-    await signOutFirebaseSync();
+    await signOutFirebaseAuth().catch(() => undefined);
     cloudSessionPassphraseRef.current = null;
     setIsCloudPassphraseUnlocked(false);
     setCloudAuthUser(null);
@@ -5497,6 +6077,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         clearAuthNotice,
         completeStoreLogin,
         createOwnerAccount,
+        signInWithEmailPassword,
+        signInWithGoogle,
+        signUpWithEmailPassword,
         registerStoreOwnerWithFirebase,
         requestPasswordResetEmail,
         recoverOwnerWithStoreDetails,
@@ -5578,6 +6161,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         updateAutoBackupSettings,
         refreshStorageTelemetry,
         purgeLegacyLocalStorageArchive,
+
+        // Cloud Firestore Database Sync
+        firestoreSyncStatus,
+        syncNowToFirestore,
+        pullFromFirestore,
+        resendEmailVerification,
+        refreshEmailVerificationStatus,
 
         // Phase 5: Encrypted Firebase Cloud Backup & Disaster Recovery
         cloudAuthUser,

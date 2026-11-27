@@ -30,6 +30,9 @@ import { CustomerPortalView } from './components/CustomerPortalView';
 import { SupplierPortalView } from './components/SupplierPortalView';
 import { OfflineIndicator, SafeUpdateBanner } from './components/PWAInstallButton';
 import { BrandLogo } from './components/BrandLogo';
+import { GlobalErrorBoundary } from './components/ErrorBoundary';
+
+export { GlobalErrorBoundary };
 
 const shouldSkipWelcomeOnLaunch = (): boolean => {
   if (typeof window === 'undefined') return false;
@@ -44,6 +47,7 @@ const MainAppContent: React.FC = () => {
   const {
     profile,
     activeTab,
+    setActiveTab,
     authStatus,
     authInitStage,
     authSession,
@@ -216,21 +220,27 @@ const MainAppContent: React.FC = () => {
         )}
 
         <main className="flex-1 p-3.5 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
-          {activeTab === 'DASHBOARD' && <DashboardView />}
-          {activeTab === 'BILLS_AUDIT' && <BillsAuditView />}
-          {activeTab === 'FINANCIAL_OVERVIEW' && <FinancialOverviewView />}
-          {activeTab === 'CUSTOMERS' && <CustomersView />}
-          {activeTab === 'SUPPLIERS' && <SuppliersView />}
-          {activeTab === 'SALES' && <SalesView />}
-          {activeTab === 'PURCHASES' && <PurchasesView />}
-          {activeTab === 'EXPENSES' && <ExpensesView />}
-          {activeTab === 'CASHBOOK' && <CashbookView />}
-          {activeTab === 'INVENTORY' && <InventoryView />}
-          {activeTab === 'ANALYTICS' && <AnalyticsView />}
-          {activeTab === 'REPORTS' && <ReportsView />}
-          {activeTab === 'DOCUMENTS' && <BillDocumentsView />}
-          {activeTab === 'WHATSAPP_REMINDERS' && <WhatsAppRemindersView />}
-          {activeTab === 'SETTINGS' && <SettingsView />}
+          <GlobalErrorBoundary
+            scope="view"
+            resetKey={activeTab}
+            onNavigateHome={() => setActiveTab('DASHBOARD')}
+          >
+            {activeTab === 'DASHBOARD' && <DashboardView />}
+            {activeTab === 'BILLS_AUDIT' && <BillsAuditView />}
+            {activeTab === 'FINANCIAL_OVERVIEW' && <FinancialOverviewView />}
+            {activeTab === 'CUSTOMERS' && <CustomersView />}
+            {activeTab === 'SUPPLIERS' && <SuppliersView />}
+            {activeTab === 'SALES' && <SalesView />}
+            {activeTab === 'PURCHASES' && <PurchasesView />}
+            {activeTab === 'EXPENSES' && <ExpensesView />}
+            {activeTab === 'CASHBOOK' && <CashbookView />}
+            {activeTab === 'INVENTORY' && <InventoryView />}
+            {activeTab === 'ANALYTICS' && <AnalyticsView />}
+            {activeTab === 'REPORTS' && <ReportsView />}
+            {activeTab === 'DOCUMENTS' && <BillDocumentsView />}
+            {activeTab === 'WHATSAPP_REMINDERS' && <WhatsAppRemindersView />}
+            {activeTab === 'SETTINGS' && <SettingsView />}
+          </GlobalErrorBoundary>
         </main>
       </div>
 
@@ -251,8 +261,10 @@ const MainAppContent: React.FC = () => {
 
 export default function App() {
   return (
-    <StoreProvider>
-      <MainAppContent />
-    </StoreProvider>
+    <GlobalErrorBoundary scope="app">
+      <StoreProvider>
+        <MainAppContent />
+      </StoreProvider>
+    </GlobalErrorBoundary>
   );
 }
